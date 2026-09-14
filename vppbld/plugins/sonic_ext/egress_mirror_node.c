@@ -26,9 +26,10 @@ sonic_ext_acl_deferred_mirror_stamp (vlib_buffer_t *b, u32 rx_sw_if_index,
 {
   sonic_ext_buffer_opaque_t *opaque = sonic_ext_buffer (b);
 
-  opaque->magic = SONIC_EXT_BUFFER_MAGIC;
-  opaque->orig_rx_sw_if_index = rx_sw_if_index;
-  opaque->orig_vlan_tag = SONIC_EXT_INVALID_VLAN_TAG;
+  /* magic/orig_rx_sw_if_index/orig_vlan_tag are owned by sonic-ext-capture and
+   * consumed by the punt redirect nodes. A matched packet may still be punted
+   * to the host, so only claim mirror_sw_if_index here. */
+  (void) rx_sw_if_index;
   opaque->mirror_sw_if_index = mirror_sw_if_index;
   b->flags |= SONIC_EXT_BUFFER_F_MIRROR_PENDING;
 
@@ -70,13 +71,14 @@ VLIB_NODE_FN (sonic_ext_egress_mirror_node) (vlib_main_t *vm,
             {
               sonic_ext_buffer_opaque_t *opaque = sonic_ext_buffer (buffer);
               u32 mirror_sw_if_index = opaque->mirror_sw_if_index;
-              u32 magic = opaque->magic;
 
               buffer->flags &= ~SONIC_EXT_BUFFER_F_MIRROR_PENDING;
               opaque->mirror_sw_if_index = SONIC_EXT_INVALID_SW_IF_INDEX;
 
-              if (magic == SONIC_EXT_BUFFER_MAGIC &&
-                  mirror_sw_if_index != SONIC_EXT_INVALID_SW_IF_INDEX &&
+              /* MIRROR_PENDING is set only by the stamp above, so it is the
+               * validity signal; magic may already have been consumed by a
+               * punt redirect node. */
+              if (mirror_sw_if_index != SONIC_EXT_INVALID_SW_IF_INDEX &&
                   !(buffer->flags & VNET_BUFFER_F_SPAN_CLONE) &&
                   vnet_sw_interface_is_valid (vnm, mirror_sw_if_index) &&
                   vnet_sw_interface_is_up (vnm, mirror_sw_if_index))
