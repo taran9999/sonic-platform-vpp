@@ -245,6 +245,8 @@ plugins {
 	plugin ip_validate_plugin.so { enable }
 	plugin sflow_plugin.so { enable }
 	plugin sonic_ext_plugin.so { enable }
+	plugin crypto_native_plugin.so { enable }
+	plugin crypto_openssl_plugin.so { enable }
 	plugin gre_plugin.so { enable }
 	plugin policer_plugin.so { enable }
 	plugin nat_plugin.so { enable }
@@ -266,10 +268,11 @@ plugins {
 ## is, so VPP neither answers ND nor learns neighbors from it; off leaves ND to
 ## VPP.
 ##
-## saivpp-wired: ip2me, l2-trap-fixup, l2-trap-learn, l2-vlan-filter.  VPP only
-## stores these and answers sonic_ext_feature_get(); saivpp asks before
-## installing the ACL hook or the classify sessions.  "show interface features"
+## saivpp-wired: ip2me, l2-trap-fixup, l2-trap-learn, l2-vlan-filter, macsec.
+## VPP only stores these and answers sonic_ext_feature_get(); saivpp asks before
+## installing the ACL hook, classify sessions, or SecY.  "show interface features"
 ## does NOT reflect them the way it does for the VPP-wired features above.
+## macsec=off refuses the sonic_ext_macsec_* binary APIs (FEATURE_DISABLED).
 ##
 ## Generated at runtime by vpp_init.sh from $SONIC_EXT_CONFIG, which is given as
 ## comma-separated key=value pairs -- SONIC_EXT_CONFIG=host-xc=off -- and which
@@ -284,6 +287,7 @@ plugins {
     # l2-trap-fixup off
     # l2-trap-learn off
     # l2-vlan-filter off
+    # macsec off
 # }
 
 ## Statistics Segment
