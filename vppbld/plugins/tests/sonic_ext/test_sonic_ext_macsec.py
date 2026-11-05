@@ -79,16 +79,6 @@ class SonicExtMacsecBase(VppTestCase):
         "{",
         "enable",
         "}",
-        "plugin",
-        "crypto_native_plugin.so",
-        "{",
-        "enable",
-        "}",
-        "plugin",
-        "crypto_openssl_plugin.so",
-        "{",
-        "enable",
-        "}",
     ]
 
     @classmethod
@@ -126,7 +116,7 @@ class SonicExtMacsecBase(VppTestCase):
     def sak32(self):
         return (TEST_SAK + bytes(32))[:32]
 
-    def add_secy(self, sw_if_index, direction, send_sci=1, an=0):
+    def add_secy(self, sw_if_index, direction, send_sci=1, an=0, sci=TEST_SCI):
         self.vapi.sonic_ext_macsec_port_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
@@ -142,7 +132,7 @@ class SonicExtMacsecBase(VppTestCase):
         self.vapi.sonic_ext_macsec_sc_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
-            sci=TEST_SCI,
+            sci=sci,
             cipher_suite=CS_GCM_AES_128,
             explicit_sci=send_sci,
             confidentiality_offset=0,
@@ -151,7 +141,7 @@ class SonicExtMacsecBase(VppTestCase):
         self.vapi.sonic_ext_macsec_sa_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
-            sci=TEST_SCI,
+            sci=sci,
             an=an,
             sak=self.sak32(),
             sak_len=16,
@@ -162,7 +152,7 @@ class SonicExtMacsecBase(VppTestCase):
             is_add=True,
         )
         self.vapi.sonic_ext_macsec_sc_set_encoding_an(
-            sw_if_index=sw_if_index, sci=TEST_SCI, an=an
+            sw_if_index=sw_if_index, sci=sci, an=an
         )
 
     def data_pkt(self):
@@ -244,6 +234,16 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
             rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
             self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
             self.assertEqual(int.from_bytes(raw(rx)[12:14], "big"), etype)
+
+    def test_shared_chassis_sci(self):
+        """two ports may share one egress SCI (SONiC chassis SCI)"""
+        chassis_sci = 0x0100A919D5D05922
+        self.add_secy(self.pg0.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        out = self.vapi.cli("show macsec")
+        self.assertEqual(out.count("sc 0x0100a919d5d05922"), 2)
+        sa_out = self.vapi.cli("show macsec sa")
+        self.assertEqual(sa_out.count("sak-len 16"), 2)
 
     def test_show_macsec_hides_sak(self):
         """show macsec sa prints key length, never the SAK"""

@@ -270,8 +270,8 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
 
   if (!is_add)
     {
-      existing = sonic_ext_macsec_sc_by_sci (sci, direction);
-      if (!existing || existing->port_index != sw_if_index)
+      existing = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction);
+      if (!existing)
 	return VNET_API_ERROR_NO_SUCH_ENTRY;
       return sonic_ext_macsec_sc_destroy (existing - mm->scs);
     }
@@ -281,7 +281,7 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
     return VNET_API_ERROR_NO_SUCH_ENTRY;
   if (port->sc_index != ~0)
     return VNET_API_ERROR_VALUE_EXIST;
-  if (sonic_ext_macsec_sc_by_sci (sci, direction))
+  if (sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction))
     return VNET_API_ERROR_VALUE_EXIST;
 
   sonic_ext_macsec_ensure_hash ();
@@ -289,6 +289,7 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
   sc_index = sc - mm->scs;
   clib_memset (&sc->key, 0, sizeof (sc->key));
   sc->key.sci = sci;
+  sc->key.sw_if_index = sw_if_index;
   sc->key.direction = direction;
   sc->sci = sci;
   sc->port_index = sw_if_index;
@@ -310,10 +311,10 @@ sonic_ext_macsec_sc_set_encoding_an (u32 sw_if_index, u64 sci, u8 an)
   if (an >= SONIC_EXT_MACSEC_AN_MAX)
     return VNET_API_ERROR_INVALID_VALUE;
 
-  sc = sonic_ext_macsec_sc_by_sci (sci, SONIC_EXT_MACSEC_EGRESS);
+  sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, SONIC_EXT_MACSEC_EGRESS);
   if (!sc)
-    sc = sonic_ext_macsec_sc_by_sci (sci, SONIC_EXT_MACSEC_INGRESS);
-  if (!sc || sc->port_index != sw_if_index)
+    sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, SONIC_EXT_MACSEC_INGRESS);
+  if (!sc)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
 
   clib_atomic_store_rel_n (&sc->encoding_an, an);
@@ -334,8 +335,8 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
   if (direction >= SONIC_EXT_MACSEC_N_DIR || an >= SONIC_EXT_MACSEC_AN_MAX)
     return VNET_API_ERROR_INVALID_VALUE;
 
-  sc = sonic_ext_macsec_sc_by_sci (sci, direction);
-  if (!sc || sc->port_index != sw_if_index)
+  sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction);
+  if (!sc)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
 
   if (!is_add)
@@ -361,7 +362,8 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 	{
 	  clib_warning (
 	    "sonic-ext macsec: no aes-128-gcm handler bound "
-	    "(enable crypto_native_plugin or crypto_openssl_plugin)");
+	    "(install vpp-crypto-engines; native/openssl auto-load "
+	    "from vpp_crypto_engines/)");
 	  mm->no_handler_logged = 1;
 	}
       return VNET_API_ERROR_UNSPECIFIED;
@@ -393,8 +395,8 @@ sonic_ext_macsec_sa_set_xpn (u32 sw_if_index, u8 direction, u64 sci, u8 an,
   if (direction >= SONIC_EXT_MACSEC_N_DIR || an >= SONIC_EXT_MACSEC_AN_MAX)
     return VNET_API_ERROR_INVALID_VALUE;
 
-  sc = sonic_ext_macsec_sc_by_sci (sci, direction);
-  if (!sc || sc->port_index != sw_if_index)
+  sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction);
+  if (!sc)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
   sa = sonic_ext_macsec_sa_get (sc->sa_index[an]);
   if (!sa)

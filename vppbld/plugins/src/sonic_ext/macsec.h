@@ -48,11 +48,14 @@ enum
   SONIC_EXT_MACSEC_CS_GCM_AES_XPN_256,
 };
 
+/* SONiC reuses one chassis SCI on every protected port.  VPP must key
+ * SCs by (sw_if_index, sci, direction) so two ports can share an SCI. */
 typedef struct
 {
   u64 sci;
+  u32 sw_if_index;
   u8 direction;
-  u8 pad[7];
+  u8 pad[3];
 } sonic_ext_macsec_sc_key_t;
 
 typedef struct
@@ -154,7 +157,7 @@ sonic_ext_macsec_sa_get (u32 sa_index)
 }
 
 static_always_inline sonic_ext_macsec_sc_t *
-sonic_ext_macsec_sc_by_sci (u64 sci, u8 direction)
+sonic_ext_macsec_sc_by_sci (u32 sw_if_index, u64 sci, u8 direction)
 {
   sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
   sonic_ext_macsec_sc_key_t k;
@@ -164,6 +167,7 @@ sonic_ext_macsec_sc_by_sci (u64 sci, u8 direction)
     return 0;
   clib_memset (&k, 0, sizeof (k));
   k.sci = sci;
+  k.sw_if_index = sw_if_index;
   k.direction = direction;
   p = hash_get_mem (mm->sc_by_key, &k);
   if (!p)

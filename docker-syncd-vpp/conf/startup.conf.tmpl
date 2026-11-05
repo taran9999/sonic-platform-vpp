@@ -245,8 +245,6 @@ plugins {
 	plugin ip_validate_plugin.so { enable }
 	plugin sflow_plugin.so { enable }
 	plugin sonic_ext_plugin.so { enable }
-	plugin crypto_native_plugin.so { enable }
-	plugin crypto_openssl_plugin.so { enable }
 	plugin gre_plugin.so { enable }
 	plugin policer_plugin.so { enable }
 	plugin nat_plugin.so { enable }
@@ -255,6 +253,11 @@ plugins {
 	# plugin dpdk_plugin.so { disable }
 	# plugin acl_plugin.so { disable }
 }
+
+## AES-GCM lives in vpp-crypto-engines (native_crypto_engine.so /
+## openssl_crypto_engine.so under .../vpp_crypto_engines/), not in
+## vpp_plugins. VPP auto-loads every .so in that directory. There is no
+## crypto_native_plugin.so in this VPP; do not put one under plugins {}.
 
 ## sonic-ext plugin feature selection.  Every feature defaults to on, so a
 ## keyword is only needed to turn one off.  Changing this requires a VPP

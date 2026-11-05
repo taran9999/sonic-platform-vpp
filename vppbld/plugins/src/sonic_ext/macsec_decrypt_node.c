@@ -188,7 +188,8 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       if (send_sci)
 	{
 	  sci = sonic_ext_macsec_sci_load (p + 20);
-	  sc = sonic_ext_macsec_sc_by_sci (sci, SONIC_EXT_MACSEC_INGRESS);
+	  sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci,
+					  SONIC_EXT_MACSEC_INGRESS);
 	}
       else
 	{
