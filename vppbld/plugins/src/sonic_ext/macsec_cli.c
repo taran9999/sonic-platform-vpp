@@ -78,8 +78,18 @@ sonic_ext_macsec_show_port (vlib_main_t *vm, vnet_main_t *vnm,
       return;
     }
 
-  vlib_cli_output (vm, "    sc 0x%016llx cipher %s encoding-an %u", sc->sci,
-		   sonic_ext_macsec_cipher_name (sc->cipher), sc->encoding_an);
+  {
+    u8 ieee[8];
+
+    sonic_ext_macsec_sci_store (ieee, sc->sci);
+    vlib_cli_output (
+      vm,
+      "    sc 0x%016llx ieee %02x%02x%02x%02x%02x%02x%02x%02x cipher %s "
+      "encoding-an %u",
+      (unsigned long long) sc->sci, ieee[0], ieee[1], ieee[2], ieee[3], ieee[4],
+      ieee[5], ieee[6], ieee[7], sonic_ext_macsec_cipher_name (sc->cipher),
+      sc->encoding_an);
+  }
 
   for (an = 0; an < SONIC_EXT_MACSEC_AN_MAX; an++)
     {

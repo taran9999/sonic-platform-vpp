@@ -46,7 +46,8 @@ format_sonic_ext_macsec_encrypt_trace (u8 *s, va_list *args)
 
 #define foreach_sonic_ext_macsec_encrypt_error                                \
   _ (ENCRYPTED, "packets encrypted")                                          \
-  _ (BYPASS, "eapol/lacp/disabled bypass")                                    \
+  _ (BYPASS, "eapol/disabled bypass")                                         \
+  _ (TX_IS_BOND, "bypass: tx is bond master")                                 \
   _ (NO_SA, "dropped: no encoding SA")                                        \
   _ (CHAINED, "dropped: chained buffer")                                      \
   _ (NO_HEADROOM, "dropped: no SecTAG headroom")                              \
@@ -120,14 +121,17 @@ VLIB_NODE_FN (sonic_ext_macsec_encrypt_node)
       if (PREDICT_FALSE (!port || !port->enabled || b[0]->current_length < 14))
 	{
 	  vnet_feature_next (&next0, b[0]);
-	  n_errors[SONIC_EXT_MACSEC_ENCRYPT_ERROR_BYPASS]++;
+	  if ((!port || !port->enabled) && sonic_ext_phy_is_bond (sw_if_index))
+	    n_errors[SONIC_EXT_MACSEC_ENCRYPT_ERROR_TX_IS_BOND]++;
+	  else
+	    n_errors[SONIC_EXT_MACSEC_ENCRYPT_ERROR_BYPASS]++;
 	  goto done0;
 	}
 
       eth = vlib_buffer_get_current (b[0]);
       etype = clib_net_to_host_u16 (eth->type);
-      if (etype == ETHERNET_TYPE_802_1X_AUTHENTICATION ||
-	  etype == ETHERNET_TYPE_SLOW_PROTOCOLS)
+      /* EAPOL stays on the uncontrolled port. LACP is protected. */
+      if (etype == ETHERNET_TYPE_802_1X_AUTHENTICATION)
 	{
 	  vnet_feature_next (&next0, b[0]);
 	  n_errors[SONIC_EXT_MACSEC_ENCRYPT_ERROR_BYPASS]++;

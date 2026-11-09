@@ -28,6 +28,7 @@ typedef struct
   u16 etype;
   u8 an;
   u8 dropped;
+  u64 sci;
 } sonic_ext_macsec_decrypt_trace_t;
 
 static u8 *
@@ -38,15 +39,18 @@ format_sonic_ext_macsec_decrypt_trace (u8 *s, va_list *args)
   sonic_ext_macsec_decrypt_trace_t *t =
     va_arg (*args, sonic_ext_macsec_decrypt_trace_t *);
 
-  s = format (s, "SONIC-EXT-MACSEC-DECRYPT: rx %u etype 0x%04x an %u pn %u sa %u %s",
-	      t->sw_if_index, t->etype, t->an, t->pn, t->sa_index,
+  s = format (s,
+	      "SONIC-EXT-MACSEC-DECRYPT: rx %u etype 0x%04x an %u pn %u "
+	      "sci 0x%016llx sa %u %s",
+	      t->sw_if_index, t->etype, t->an, t->pn,
+	      (unsigned long long) t->sci, t->sa_index,
 	      t->dropped ? "DROP" : "ok");
   return s;
 }
 
 #define foreach_sonic_ext_macsec_decrypt_error                                \
   _ (OK, "packets decrypted")                                                 \
-  _ (BYPASS, "eapol/lacp/disabled bypass")                                    \
+  _ (BYPASS, "eapol/disabled bypass")                                         \
   _ (NOT_USING_SA, "dropped: not a MACsec frame")                             \
   _ (NO_SCI, "dropped: unknown SCI")                                          \
   _ (NO_SA, "dropped: no SA for AN")                                          \
@@ -115,7 +119,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       u8 *p, *secure;
       u32 need, secure_len;
       u32 slot = (u32) (b - bufs);
-      u64 sci;
+      u64 sci = 0;
 
       port = sonic_ext_macsec_port_get (sw_if_index, SONIC_EXT_MACSEC_INGRESS);
       if (PREDICT_FALSE (!port || !port->enabled || b[0]->current_length < 14))
@@ -127,8 +131,8 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 
       eth = vlib_buffer_get_current (b[0]);
       etype = clib_net_to_host_u16 (eth->type);
-      if (etype == ETHERNET_TYPE_802_1X_AUTHENTICATION ||
-	  etype == ETHERNET_TYPE_SLOW_PROTOCOLS)
+      /* EAPOL stays on the uncontrolled port. LACP is protected. */
+      if (etype == ETHERNET_TYPE_802_1X_AUTHENTICATION)
 	{
 	  vnet_feature_next (&next0, b[0]);
 	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_BYPASS]++;
@@ -256,6 +260,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  t->etype = etype;
 	  t->an = an;
 	  t->dropped = dropped;
+	  t->sci = sci;
 	}
 
       b += 1;

@@ -3,7 +3,8 @@
 
 L2 xconnect pg0 <-> pg1.  Egress SecY on pg1 encrypts frames that
 arrive on pg0; ingress SecY on pg0 decrypts frames injected there.
-EAPOL (0x888E) and LACP (0x8809) must pass a protected port unmodified.
+EAPOL (0x888E) must pass a protected port unmodified. LACP (0x8809)
+is on the controlled port and is MACsec-encapsulated.
 """
 
 import struct
@@ -225,15 +226,27 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
         sa_out = self.vapi.cli("show macsec sa")
         self.assertRegex(sa_out, r"in-not-valid 1")
 
-    def test_eapol_lacp_bypass(self):
-        """EAPOL and LACP on a protected port are unmodified"""
+    def test_eapol_bypass(self):
+        """EAPOL on a protected port is unmodified"""
         self.add_secy(self.pg1.sw_if_index, DIR_EGRESS)
         self.add_secy(self.pg0.sw_if_index, DIR_INGRESS)
-        for etype in (EAPOL_ETHERTYPE, LACP_ETHERTYPE):
-            pkt = self.ctrl_pkt(etype)
-            rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
-            self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
-            self.assertEqual(int.from_bytes(raw(rx)[12:14], "big"), etype)
+        pkt = self.ctrl_pkt(EAPOL_ETHERTYPE)
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        self.assertEqual(int.from_bytes(raw(rx)[12:14], "big"), EAPOL_ETHERTYPE)
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the LACP protect vector")
+    def test_lacp_is_protected(self):
+        """LACP is on the controlled port and is MACsec-encapsulated"""
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS)
+        pkt = self.ctrl_pkt(LACP_ETHERTYPE)
+        expected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=1, send_sci=True
+        )
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        got = raw(rx)
+        self.assertEqual(int.from_bytes(got[12:14], "big"), MACSEC_ETHERTYPE)
+        self.assertEqual(got[: len(expected)], expected)
 
     def test_shared_chassis_sci(self):
         """two ports may share one egress SCI (SONiC chassis SCI)"""
