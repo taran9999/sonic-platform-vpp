@@ -117,7 +117,7 @@ class SonicExtMacsecBase(VppTestCase):
     def sak32(self):
         return (TEST_SAK + bytes(32))[:32]
 
-    def add_secy(self, sw_if_index, direction, send_sci=1, an=0, sci=TEST_SCI):
+    def add_port_and_sc(self, sw_if_index, direction, send_sci=1, sci=TEST_SCI):
         self.vapi.sonic_ext_macsec_port_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
@@ -139,6 +139,8 @@ class SonicExtMacsecBase(VppTestCase):
             confidentiality_offset=0,
             is_add=True,
         )
+
+    def add_sa(self, sw_if_index, direction, an=0, sci=TEST_SCI):
         self.vapi.sonic_ext_macsec_sa_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
@@ -155,6 +157,10 @@ class SonicExtMacsecBase(VppTestCase):
         self.vapi.sonic_ext_macsec_sc_set_encoding_an(
             sw_if_index=sw_if_index, sci=sci, an=an
         )
+
+    def add_secy(self, sw_if_index, direction, send_sci=1, an=0, sci=TEST_SCI):
+        self.add_port_and_sc(sw_if_index, direction, send_sci=send_sci, sci=sci)
+        self.add_sa(sw_if_index, direction, an=an, sci=sci)
 
     def data_pkt(self):
         return (
@@ -257,6 +263,27 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
         self.assertEqual(out.count("sc 0x0100a919d5d05922"), 2)
         sa_out = self.vapi.cli("show macsec sa")
         self.assertEqual(sa_out.count("sak-len 16"), 2)
+
+    def test_sa_after_all_scs_created(self):
+        """SA add still finds the SC after the SC pool has grown.
+
+        orchagent creates every SC first, then every SA. That used to
+        return VNET_API_ERROR_NO_SUCH_ENTRY (-6) because the SCI hash
+        stored pointers into the SC pool, which moves on pool_get().
+        """
+        chassis_sci = 0x0100A919D5D05922
+        peer0 = 0x12153524C0895E81
+        peer1 = 0x12153524C0895E82
+        self.add_port_and_sc(self.pg0.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        self.add_port_and_sc(self.pg0.sw_if_index, DIR_INGRESS, sci=peer0)
+        self.add_port_and_sc(self.pg1.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        self.add_port_and_sc(self.pg1.sw_if_index, DIR_INGRESS, sci=peer1)
+        self.add_sa(self.pg0.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        self.add_sa(self.pg0.sw_if_index, DIR_INGRESS, sci=peer0)
+        self.add_sa(self.pg1.sw_if_index, DIR_EGRESS, sci=chassis_sci)
+        self.add_sa(self.pg1.sw_if_index, DIR_INGRESS, sci=peer1)
+        sa_out = self.vapi.cli("show macsec sa")
+        self.assertEqual(sa_out.count("sak-len 16"), 4)
 
     def test_show_macsec_hides_sak(self):
         """show macsec sa prints key length, never the SAK"""

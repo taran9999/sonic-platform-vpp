@@ -160,8 +160,21 @@ static_always_inline sonic_ext_macsec_sc_t *
 sonic_ext_macsec_sc_by_sci (u32 sw_if_index, u64 sci, u8 direction)
 {
   sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+  sonic_ext_macsec_port_t *port;
+  sonic_ext_macsec_sc_t *sc;
   sonic_ext_macsec_sc_key_t k;
   uword *p;
+
+  /*
+   * Phase 1 is one SC per (port, direction).  Look up by the stable
+   * pool index on the port, not the SCI hash: hash_set_mem() stores a
+   * pointer to the key, and pool_get() on mm->scs can move that
+   * memory (VNET_API_ERROR_NO_SUCH_ENTRY / -6 on a later SA add).
+   */
+  port = sonic_ext_macsec_port_get (sw_if_index, direction);
+  sc = port ? sonic_ext_macsec_sc_get (port->sc_index) : 0;
+  if (sc && sc->sci == sci)
+    return sc;
 
   if (PREDICT_FALSE (mm->sc_by_key == 0))
     return 0;

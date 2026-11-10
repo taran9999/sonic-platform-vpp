@@ -28,6 +28,7 @@
 #include <vnet/feature/feature.h>
 #include <vnet/interface.h>
 #include <vnet/error.h>
+#include <vppinfra/mem.h>
 
 sonic_ext_macsec_main_t sonic_ext_macsec_main;
 
@@ -70,6 +71,33 @@ sonic_ext_macsec_ensure_hash (void)
   if (mm->sc_by_key == 0)
     mm->sc_by_key = hash_create_mem (0, sizeof (sonic_ext_macsec_sc_key_t),
 				     sizeof (uword));
+}
+
+/*
+ * hash_set_mem() stores the key POINTER, not a copy.  The SC lives in a
+ * clib pool, so the next pool_get() may realloc and invalidate every
+ * previously inserted key (SA add then returns VNET_API_ERROR_NO_SUCH_ENTRY).
+ * Keep a heap copy of the key so the hash outlives pool movement.
+ */
+static void
+sonic_ext_macsec_sc_hash_set (sonic_ext_macsec_sc_t *sc, u32 sc_index)
+{
+  sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+  sonic_ext_macsec_sc_key_t *kcopy;
+
+  sonic_ext_macsec_ensure_hash ();
+  kcopy = clib_mem_alloc (sizeof (*kcopy));
+  clib_memcpy (kcopy, &sc->key, sizeof (*kcopy));
+  hash_set_mem (mm->sc_by_key, kcopy, sc_index);
+}
+
+static void
+sonic_ext_macsec_sc_hash_unset (sonic_ext_macsec_sc_t *sc)
+{
+  sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+
+  if (mm->sc_by_key)
+    hash_unset_mem_free (&mm->sc_by_key, &sc->key);
 }
 
 static int
@@ -200,8 +228,7 @@ sonic_ext_macsec_sc_destroy (u32 sc_index)
   if (port && port->sc_index == sc_index)
     port->sc_index = ~0;
 
-  if (mm->sc_by_key)
-    hash_unset_mem (mm->sc_by_key, &sc->key);
+  sonic_ext_macsec_sc_hash_unset (sc);
   pool_put (mm->scs, sc);
   return 0;
 }
@@ -280,11 +307,16 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
   if (!port || !port->enabled)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
   if (port->sc_index != ~0)
-    return VNET_API_ERROR_VALUE_EXIST;
+    {
+      existing = sonic_ext_macsec_sc_get (port->sc_index);
+      /* Same SCI: idempotent retry. Different SCI: the port is taken. */
+      if (existing && existing->sci == sci)
+	return VNET_API_ERROR_VALUE_EXIST;
+      return VNET_API_ERROR_RSRC_IN_USE;
+    }
   if (sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction))
     return VNET_API_ERROR_VALUE_EXIST;
 
-  sonic_ext_macsec_ensure_hash ();
   pool_get_zero (mm->scs, sc);
   sc_index = sc - mm->scs;
   clib_memset (&sc->key, 0, sizeof (sc->key));
@@ -298,7 +330,7 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
   sc->encoding_an = 0;
   for (an = 0; an < SONIC_EXT_MACSEC_AN_MAX; an++)
     sc->sa_index[an] = ~0;
-  hash_set_mem (mm->sc_by_key, &sc->key, sc_index);
+  sonic_ext_macsec_sc_hash_set (sc, sc_index);
   port->sc_index = sc_index;
   return 0;
 }
