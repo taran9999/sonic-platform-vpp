@@ -182,7 +182,7 @@ VLIB_NODE_FN (sonic_ext_macsec_encrypt_node)
 
       xpn = clib_atomic_fetch_add (&sa->next_xpn, 1);
       pn = (u32) xpn;
-      if (PREDICT_FALSE (xpn > 0xffffffffULL))
+      if (PREDICT_FALSE (!sa->xpn_en && xpn > 0xffffffffULL))
 	{
 	  next0 = SONIC_EXT_MACSEC_ENCRYPT_NEXT_DROP;
 	  b[0]->error = node->errors[SONIC_EXT_MACSEC_ENCRYPT_ERROR_PN_EXHAUSTED];
@@ -208,7 +208,7 @@ VLIB_NODE_FN (sonic_ext_macsec_encrypt_node)
 	sonic_ext_macsec_sci_store (p + 20, sc->sci);
 
       secure = p + 12 + sectag_len;
-      sonic_ext_macsec_build_iv (ivs[n_enc], sc->sci, pn);
+      sonic_ext_macsec_build_iv (ivs[n_enc], sa, sc->sci, xpn);
       vnet_crypto_op_init (sa->crypto_ctx, &ops[n_enc]);
       ops[n_enc].type = VNET_CRYPTO_OP_TYPE_ENCRYPT;
       ops[n_enc].src = ops[n_enc].dst = secure;

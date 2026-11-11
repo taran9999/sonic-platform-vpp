@@ -31,8 +31,8 @@ import "vnet/interface_types.api";
     @param direction - 0 egress, 1 ingress
     @param encrypt - 1 => confidentiality (E=1,C=1); stored, Phase 1 always encrypts
     @param send_sci - 1 => include SCI in the SecTAG
-    @param replay_protect - stored; Phase 1 does not enforce replay
-    @param replay_window - stored; Phase 1 does not enforce replay
+    @param replay_protect - 1 => drop late/duplicate XPNs on ingress
+    @param replay_window - sliding window size in packets; 0 = strict increase
     @param is_add - true to create/enable, false to disable
 */
 autoreply define sonic_ext_macsec_port_add_del
@@ -52,9 +52,9 @@ autoreply define sonic_ext_macsec_port_add_del
     @param sw_if_index - protected interface
     @param direction - 0 egress, 1 ingress
     @param sci - 8-octet SCI, network-order u64
-    @param cipher_suite - 0 GCM-AES-128; others rejected in Phase 1
+    @param cipher_suite - 0 GCM-AES-128, 1 GCM-AES-256, 2 XPN-128, 3 XPN-256
     @param explicit_sci - stored; SecTAG SCI bit follows port send_sci
-    @param confidentiality_offset - must be 0 in Phase 1
+    @param confidentiality_offset - must be 0
     @param is_add - true to create, false to delete
 */
 autoreply define sonic_ext_macsec_sc_add_del
@@ -82,10 +82,10 @@ autoreply define sonic_ext_macsec_sc_set_encoding_an
 
 /** \brief Create or destroy a secure association.
     @param sak - SAK bytes; only sak_len bytes are used. Never logged.
-    @param sak_len - 16 for GCM-AES-128 (Phase 1); 32 rejected
-    @param salt - XPN salt (stored, unused in Phase 1)
-    @param ssci - XPN SSCI (stored, unused in Phase 1)
-    @param xpn_en - must be 0 in Phase 1
+    @param sak_len - 16 for GCM-AES-128/XPN-128; 32 for GCM-AES-256/XPN-256
+    @param salt - 12-byte XPN salt; unused when xpn_en is 0. Never logged.
+    @param ssci - XPN SSCI (host-order u32 on the call); unused when xpn_en is 0
+    @param xpn_en - 1 for XPN ciphers; must match cipher_suite
     @param init_xpn - next PN; 0 is treated as 1
 */
 autoreply define sonic_ext_macsec_sa_add_del

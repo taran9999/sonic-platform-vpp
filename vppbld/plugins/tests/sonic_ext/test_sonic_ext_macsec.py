@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sonic-ext MACsec GCM-AES-128 SecY tests.
+"""sonic-ext MACsec SecY tests (GCM-AES-128/256 and XPN).
 
 L2 xconnect pg0 <-> pg1.  Egress SecY on pg1 encrypts frames that
 arrive on pg0; ingress SecY on pg0 decrypts frames injected there.
@@ -19,11 +19,21 @@ from scapy.packet import Raw
 
 # IEEE 802.1AE-2018 Annex published GCM-AES-128 test SAK (not a secret).
 TEST_SAK = bytes.fromhex("ad7a2bd03eac835a6f620fdcb506b345")
+# IEEE 802.1AEbn-2011 2.2.2 published GCM-AES-256 test SAK (not a secret).
+TEST_SAK_256 = bytes.fromhex(
+    "e3c08a8f06c6e3ad95a70557b23f75483ce33021a9c72b7025666204c69c0b72"
+)
 TEST_SCI = 0x12153524C0895E81
+# Distinct test salt/SSCI for XPN IV; not a credential.
+TEST_SALT = bytes.fromhex("000102030405060708090a0b")
+TEST_SSCI = 0x01000000
 MACSEC_ETHERTYPE = 0x88E5
 EAPOL_ETHERTYPE = 0x888E
 LACP_ETHERTYPE = 0x8809
 CS_GCM_AES_128 = 0
+CS_GCM_AES_256 = 1
+CS_GCM_AES_XPN_128 = 2
+CS_GCM_AES_XPN_256 = 3
 DIR_EGRESS = 0
 DIR_INGRESS = 1
 
@@ -53,7 +63,23 @@ def _gcm_available():
 HAVE_GCM = _gcm_available()
 
 
-def macsec_protect(frame, sak, sci, an=0, pn=1, send_sci=True):
+def xpn_iv(salt, ssci, xpn):
+    """IEEE 802.1AEbw IV = salt XOR (SSCI_be32 || XPN_be64)."""
+    nonce = struct.pack("!IQ", ssci, xpn)
+    return bytes(a ^ b for a, b in zip(salt, nonce))
+
+
+def macsec_protect(
+    frame,
+    sak,
+    sci,
+    an=0,
+    pn=1,
+    send_sci=True,
+    salt=None,
+    ssci=0,
+    xpn_en=False,
+):
     """Build a confidentiality (E=1,C=1) MACsec frame matching the plugin."""
     da, sa, rest = frame[:6], frame[6:12], frame[12:]
     tci = (0x20 if send_sci else 0) | 0x0C | (an & 3)
@@ -61,7 +87,10 @@ def macsec_protect(frame, sak, sci, an=0, pn=1, send_sci=True):
     sectag = struct.pack("!BBBBI", 0x88, 0xE5, tci, sl, pn & 0xFFFFFFFF)
     if send_sci:
         sectag += struct.pack("!Q", sci)
-    iv = struct.pack("!QI", sci, pn & 0xFFFFFFFF)
+    if xpn_en:
+        iv = xpn_iv(salt, ssci, pn)
+    else:
+        iv = struct.pack("!QI", sci, pn & 0xFFFFFFFF)
     aad = da + sa + sectag
     return da + sa + sectag + _aes_gcm_encrypt(sak, iv, aad, rest)
 
@@ -114,53 +143,137 @@ class SonicExtMacsecBase(VppTestCase):
         for interface in self.pg_interfaces:
             interface.admin_down()
 
-    def sak32(self):
-        return (TEST_SAK + bytes(32))[:32]
+    def sak32(self, sak=None):
+        if sak is None:
+            sak = TEST_SAK
+        return (sak + bytes(32))[:32]
 
-    def add_port_and_sc(self, sw_if_index, direction, send_sci=1, sci=TEST_SCI):
+    def add_port_and_sc(
+        self,
+        sw_if_index,
+        direction,
+        send_sci=1,
+        sci=TEST_SCI,
+        cipher_suite=CS_GCM_AES_128,
+        replay_protect=0,
+        replay_window=0,
+    ):
         self.vapi.sonic_ext_macsec_port_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
             encrypt=1,
             send_sci=send_sci,
-            replay_protect=0,
-            replay_window=0,
+            replay_protect=replay_protect,
+            replay_window=replay_window,
             is_add=True,
         )
-        self._secy.append(dict(sw_if_index=sw_if_index, direction=direction,
-                               encrypt=1, send_sci=send_sci, replay_protect=0,
-                               replay_window=0))
+        self._secy.append(
+            dict(
+                sw_if_index=sw_if_index,
+                direction=direction,
+                encrypt=1,
+                send_sci=send_sci,
+                replay_protect=replay_protect,
+                replay_window=replay_window,
+            )
+        )
         self.vapi.sonic_ext_macsec_sc_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
             sci=sci,
-            cipher_suite=CS_GCM_AES_128,
+            cipher_suite=cipher_suite,
             explicit_sci=send_sci,
             confidentiality_offset=0,
             is_add=True,
         )
 
-    def add_sa(self, sw_if_index, direction, an=0, sci=TEST_SCI):
+    def add_sa(
+        self,
+        sw_if_index,
+        direction,
+        an=0,
+        sci=TEST_SCI,
+        sak=None,
+        sak_len=16,
+        salt=None,
+        ssci=0,
+        xpn_en=0,
+        init_xpn=1,
+        set_encoding=True,
+    ):
+        if salt is None:
+            salt = bytes(12)
         self.vapi.sonic_ext_macsec_sa_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
             sci=sci,
             an=an,
-            sak=self.sak32(),
-            sak_len=16,
+            sak=self.sak32(sak),
+            sak_len=sak_len,
+            salt=salt,
+            ssci=ssci,
+            xpn_en=xpn_en,
+            init_xpn=init_xpn,
+            is_add=True,
+        )
+        if set_encoding:
+            self.vapi.sonic_ext_macsec_sc_set_encoding_an(
+                sw_if_index=sw_if_index, sci=sci, an=an
+            )
+
+    def del_sa(self, sw_if_index, direction, an=0, sci=TEST_SCI):
+        self.vapi.sonic_ext_macsec_sa_add_del(
+            sw_if_index=sw_if_index,
+            direction=direction,
+            sci=sci,
+            an=an,
+            sak=bytes(32),
+            sak_len=0,
             salt=bytes(12),
             ssci=0,
             xpn_en=0,
-            init_xpn=1,
-            is_add=True,
-        )
-        self.vapi.sonic_ext_macsec_sc_set_encoding_an(
-            sw_if_index=sw_if_index, sci=sci, an=an
+            init_xpn=0,
+            is_add=False,
         )
 
-    def add_secy(self, sw_if_index, direction, send_sci=1, an=0, sci=TEST_SCI):
-        self.add_port_and_sc(sw_if_index, direction, send_sci=send_sci, sci=sci)
-        self.add_sa(sw_if_index, direction, an=an, sci=sci)
+    def add_secy(
+        self,
+        sw_if_index,
+        direction,
+        send_sci=1,
+        an=0,
+        sci=TEST_SCI,
+        cipher_suite=CS_GCM_AES_128,
+        sak=None,
+        sak_len=16,
+        salt=None,
+        ssci=0,
+        xpn_en=0,
+        init_xpn=1,
+        replay_protect=0,
+        replay_window=0,
+    ):
+        self.add_port_and_sc(
+            sw_if_index,
+            direction,
+            send_sci=send_sci,
+            sci=sci,
+            cipher_suite=cipher_suite,
+            replay_protect=replay_protect,
+            replay_window=replay_window,
+        )
+        self.add_sa(
+            sw_if_index,
+            direction,
+            an=an,
+            sci=sci,
+            sak=sak,
+            sak_len=sak_len,
+            salt=salt,
+            ssci=ssci,
+            xpn_en=xpn_en,
+            init_xpn=init_xpn,
+        )
 
     def data_pkt(self):
         return (
@@ -295,46 +408,55 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
         self.assertNotIn(TEST_SAK.hex().upper(), out)
         self.assertRegex(self.vapi.cli("show macsec"), r"macsec:\s+on")
 
-    def test_phase1_rejects_xpn_and_aes256(self):
-        """Phase 1 rejects AES-256, XPN, and sak_len != 16"""
-        self.vapi.sonic_ext_macsec_port_add_del(
-            sw_if_index=self.pg1.sw_if_index,
-            direction=DIR_EGRESS,
-            encrypt=1,
-            send_sci=1,
-            replay_protect=0,
-            replay_window=0,
-            is_add=True,
+    def test_accepts_aes256_and_xpn(self):
+        """AES-256 and XPN SCs/SAs install; cipher vs sak_len/xpn_en must match"""
+        self.add_port_and_sc(
+            self.pg1.sw_if_index, DIR_EGRESS, cipher_suite=CS_GCM_AES_256
         )
-        self._secy.append(
-            dict(
-                sw_if_index=self.pg1.sw_if_index,
-                direction=DIR_EGRESS,
-                encrypt=1,
-                send_sci=1,
-                replay_protect=0,
-                replay_window=0,
-            )
+        self.add_sa(
+            self.pg1.sw_if_index,
+            DIR_EGRESS,
+            sak=TEST_SAK_256,
+            sak_len=32,
         )
+        out = self.vapi.cli("show macsec sa")
+        self.assertIn("sak-len 32", out)
+        self.assertIn("gcm-aes-256", out)
+        self.assertNotIn(TEST_SAK_256.hex(), out.lower())
+
+        self.add_port_and_sc(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            cipher_suite=CS_GCM_AES_XPN_256,
+        )
+        self.add_sa(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+        )
+        out = self.vapi.cli("show macsec sa")
+        self.assertIn("gcm-aes-xpn-256", out)
+        self.assertIn("xpn-en 1", out)
+        self.assertNotIn(TEST_SALT.hex(), out.lower())
+
         with self.vapi.assert_negative_api_retval():
             self.vapi.sonic_ext_macsec_sc_add_del(
                 sw_if_index=self.pg1.sw_if_index,
                 direction=DIR_EGRESS,
-                sci=TEST_SCI,
-                cipher_suite=1,
+                sci=TEST_SCI + 1,
+                cipher_suite=4,
                 explicit_sci=1,
                 confidentiality_offset=0,
                 is_add=True,
             )
-        self.vapi.sonic_ext_macsec_sc_add_del(
-            sw_if_index=self.pg1.sw_if_index,
-            direction=DIR_EGRESS,
-            sci=TEST_SCI,
-            cipher_suite=CS_GCM_AES_128,
-            explicit_sci=1,
-            confidentiality_offset=0,
-            is_add=True,
-        )
+
+    def test_rejects_cipher_sak_mismatch(self):
+        """sak_len and xpn_en must match the SC cipher suite"""
+        self.add_port_and_sc(self.pg1.sw_if_index, DIR_EGRESS)
         with self.vapi.assert_negative_api_retval():
             self.vapi.sonic_ext_macsec_sa_add_del(
                 sw_if_index=self.pg1.sw_if_index,
@@ -363,6 +485,216 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
                 init_xpn=1,
                 is_add=True,
             )
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the AES-256 vector")
+    def test_encrypt_aes256_known_answer(self):
+        """plaintext on pg0 is GCM-AES-256 encapsulated on pg1"""
+        self.add_secy(
+            self.pg1.sw_if_index,
+            DIR_EGRESS,
+            cipher_suite=CS_GCM_AES_256,
+            sak=TEST_SAK_256,
+            sak_len=32,
+        )
+        pkt = self.data_pkt()
+        expected = macsec_protect(
+            raw(pkt), TEST_SAK_256, TEST_SCI, an=0, pn=1, send_sci=True
+        )
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        got = raw(rx)
+        self.assertEqual(int.from_bytes(got[12:14], "big"), MACSEC_ETHERTYPE)
+        self.assertEqual(got[: len(expected)], expected)
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the XPN-256 vector")
+    def test_encrypt_xpn256_known_answer(self):
+        """XPN-256 IV is salt XOR (SSCI || XPN)"""
+        self.add_secy(
+            self.pg1.sw_if_index,
+            DIR_EGRESS,
+            cipher_suite=CS_GCM_AES_XPN_256,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+        )
+        pkt = self.data_pkt()
+        expected = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=0,
+            pn=1,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        got = raw(rx)
+        self.assertEqual(int.from_bytes(got[12:14], "big"), MACSEC_ETHERTYPE)
+        self.assertEqual(got[: len(expected)], expected)
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build the XPN decrypt input")
+    def test_decrypt_xpn256_round_trip(self):
+        """XPN-256 ciphertext on pg0 decrypts to the original Ethernet frame"""
+        pkt = self.data_pkt()
+        protected = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=0,
+            pn=1,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            cipher_suite=CS_GCM_AES_XPN_256,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build XPN wrap frames")
+    def test_xpn_wrap_recovery(self):
+        """ingress reconstructs the upper 32 bits after the 32-bit PN wraps"""
+        pkt = self.data_pkt()
+        high_pn = 0xFFFFFF00
+        wrap_pn = 0x100000010
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            cipher_suite=CS_GCM_AES_XPN_256,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+            init_xpn=high_pn,
+        )
+        first = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=0,
+            pn=high_pn,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(first)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+        wrapped = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=0,
+            pn=wrap_pn,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        self.assertEqual(struct.unpack("!I", wrapped[16:20])[0], wrap_pn & 0xFFFFFFFF)
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(wrapped)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build replay frames")
+    def test_replay_duplicate_dropped(self):
+        """duplicate PN is dropped as late when replay protection is on"""
+        pkt = self.data_pkt()
+        protected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=1, send_sci=True
+        )
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            replay_protect=1,
+            replay_window=0,
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+        )
+        self.send_and_assert_no_replies(self.pg0, [self.wire_pkt(protected)])
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+            ),
+            before + 1,
+        )
+        sa_out = self.vapi.cli("show macsec sa")
+        self.assertRegex(sa_out, r"in-late 1")
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build replay frames")
+    def test_replay_forward_jump_and_window(self):
+        """large forward PN jumps are accepted; out-of-window PNs are late"""
+        pkt = self.data_pkt()
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            replay_protect=1,
+            replay_window=4,
+        )
+
+        def send_pn(pn):
+            protected = macsec_protect(
+                raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=pn, send_sci=True
+            )
+            rx = self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)[0]
+            self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+        send_pn(1)
+        send_pn(1000)
+        send_pn(998)
+        late = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=990, send_sci=True
+        )
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+        )
+        self.send_and_assert_no_replies(self.pg0, [self.wire_pkt(late)])
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+            ),
+            before + 1,
+        )
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the rekey vector")
+    def test_rekey_encoding_an(self):
+        """AN flip under traffic uses the new SA; deleting the old SA is lossless"""
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS, an=0)
+        pkt = self.data_pkt()
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        self.assertEqual(raw(rx)[14] & 0x03, 0)
+
+        self.add_sa(self.pg1.sw_if_index, DIR_EGRESS, an=1)
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        self.assertEqual(raw(rx)[14] & 0x03, 1)
+        expected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=1, pn=1, send_sci=True
+        )
+        self.assertEqual(raw(rx)[: len(expected)], expected)
+
+        self.del_sa(self.pg1.sw_if_index, DIR_EGRESS, an=0)
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        self.assertEqual(raw(rx)[14] & 0x03, 1)
+        expected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=1, pn=2, send_sci=True
+        )
+        self.assertEqual(raw(rx)[: len(expected)], expected)
 
 
 if __name__ == "__main__":

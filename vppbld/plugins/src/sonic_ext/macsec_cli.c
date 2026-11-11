@@ -47,11 +47,11 @@ sonic_ext_macsec_show_sa (vlib_main_t *vm, sonic_ext_macsec_sc_t *sc,
 {
   vlib_cli_output (
     vm,
-    "    sa %u an %u sak-len %u cipher %s pn %llu lowest %llu "
-    "out-enc %llu in-ok %llu in-not-valid %llu",
+    "    sa %u an %u sak-len %u cipher %s xpn-en %u pn %llu lowest %llu "
+    "out-enc %llu in-ok %llu in-not-valid %llu in-late %llu",
     sa_index, sa->an, sa->sak_len, sonic_ext_macsec_cipher_name (sc->cipher),
-    sa->next_xpn, sa->lowest_acceptable_xpn, sa->out_pkts_encrypted,
-    sa->in_pkts_ok, sa->in_pkts_not_valid);
+    sa->xpn_en, sa->next_xpn, sa->lowest_acceptable_xpn, sa->out_pkts_encrypted,
+    sa->in_pkts_ok, sa->in_pkts_not_valid, sa->in_pkts_late);
 }
 
 static void

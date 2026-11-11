@@ -56,6 +56,7 @@ format_sonic_ext_macsec_decrypt_trace (u8 *s, va_list *args)
   _ (NO_SA, "dropped: no SA for AN")                                          \
   _ (CHAINED, "dropped: chained buffer")                                      \
   _ (SHORT, "dropped: truncated SecTAG")                                      \
+  _ (LATE, "dropped: replay late")                                            \
   _ (NOT_VALID, "dropped: ICV check failed")
 
 typedef enum
@@ -91,7 +92,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
   sonic_ext_macsec_sa_t *dec_sas[VLIB_FRAME_SIZE];
   sonic_ext_macsec_sc_t *dec_scs[VLIB_FRAME_SIZE];
   u8 sectag_lens[VLIB_FRAME_SIZE];
-  u32 pns[VLIB_FRAME_SIZE];
+  u64 xpns[VLIB_FRAME_SIZE];
   u32 n_dec = 0;
   u32 n_errors[SONIC_EXT_MACSEC_DECRYPT_N_ERROR] = { 0 };
   u32 i;
@@ -115,6 +116,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       u8 dropped = 0;
       u32 sa_index = ~0;
       u32 pn = 0;
+      u64 xpn = 0;
       u8 tci, send_sci, sectag_len;
       u8 *p, *secure;
       u32 need, secure_len;
@@ -222,9 +224,23 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  goto done0;
 	}
 
+      xpn = sonic_ext_macsec_recover_xpn (sc->highest_xpn_seen, pn, sa->xpn_en);
+      if (PREDICT_FALSE (port->replay_protect &&
+			 (xpn < sa->lowest_acceptable_xpn ||
+			  sonic_ext_macsec_replay_is_late (
+			    sc, xpn, 1, port->replay_window))))
+	{
+	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
+	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_LATE];
+	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_LATE]++;
+	  clib_atomic_fetch_add (&sa->in_pkts_late, 1);
+	  dropped = 1;
+	  goto done0;
+	}
+
       secure = p + 12 + sectag_len;
       secure_len = b[0]->current_length - 12 - sectag_len - SONIC_EXT_MACSEC_ICV_LEN;
-      sonic_ext_macsec_build_iv (ivs[n_dec], sci, pn);
+      sonic_ext_macsec_build_iv (ivs[n_dec], sa, sci, xpn);
       vnet_crypto_op_init (sa->crypto_ctx, &ops[n_dec]);
       ops[n_dec].type = VNET_CRYPTO_OP_TYPE_DECRYPT;
       ops[n_dec].flags = VNET_CRYPTO_OP_FLAG_HMAC_CHECK;
@@ -240,7 +256,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       dec_sas[n_dec] = sa;
       dec_scs[n_dec] = sc;
       sectag_lens[n_dec] = sectag_len;
-      pns[n_dec] = pn;
+      xpns[n_dec] = xpn;
       n_dec++;
       nexts[slot] = 0;
       goto trace0;
@@ -278,8 +294,9 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       vlib_buffer_t *b0 = bufs[slot];
       sonic_ext_macsec_sa_t *sa = dec_sas[i];
       sonic_ext_macsec_sc_t *sc = dec_scs[i];
+      sonic_ext_macsec_port_t *port;
       u8 sectag_len = sectag_lens[i];
-      u32 pn = pns[i];
+      u64 xpn = xpns[i];
       u8 *p;
 
       if (PREDICT_FALSE (ops[i].status != VNET_CRYPTO_OP_STATUS_COMPLETED))
@@ -296,10 +313,12 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       vlib_buffer_advance (b0, sectag_len);
       b0->current_length -= SONIC_EXT_MACSEC_ICV_LEN;
 
-      if (pn > sc->highest_xpn_seen)
-	sc->highest_xpn_seen = pn;
-      if ((u64) pn + 1 > sa->next_xpn)
-	clib_atomic_store_rel_n (&sa->next_xpn, (u64) pn + 1);
+      port = sonic_ext_macsec_port_get (vnet_buffer (b0)->sw_if_index[VLIB_RX],
+				       SONIC_EXT_MACSEC_INGRESS);
+      sonic_ext_macsec_replay_advance (
+	sc, xpn, port ? port->replay_window : 0);
+      if (xpn + 1 > sa->next_xpn)
+	clib_atomic_store_rel_n (&sa->next_xpn, xpn + 1);
 
       clib_atomic_fetch_add (&sa->in_pkts_ok, 1);
       clib_atomic_fetch_add (&sa->in_octets_decrypted, b0->current_length);

@@ -77,6 +77,7 @@ typedef struct
   u8 direction, cipher, encoding_an;
   u32 sa_index[SONIC_EXT_MACSEC_AN_MAX]; /* ~0 absent */
   u64 highest_xpn_seen;
+  u64 replay_bitmap_lo, replay_bitmap_hi; /* bit 0 = highest_seen */
 } sonic_ext_macsec_sc_t;
 
 typedef struct
@@ -218,12 +219,136 @@ sonic_ext_macsec_sci_load (const u8 *src)
   return clib_net_to_host_u64 (n);
 }
 
-static_always_inline void
-sonic_ext_macsec_build_iv (u8 *iv, u64 sci, u32 pn)
+static_always_inline u8
+sonic_ext_macsec_cipher_is_xpn (u8 cipher)
 {
+  return cipher == SONIC_EXT_MACSEC_CS_GCM_AES_XPN_128 ||
+	 cipher == SONIC_EXT_MACSEC_CS_GCM_AES_XPN_256;
+}
+
+static_always_inline u8
+sonic_ext_macsec_cipher_sak_len (u8 cipher)
+{
+  return (cipher == SONIC_EXT_MACSEC_CS_GCM_AES_256 ||
+	  cipher == SONIC_EXT_MACSEC_CS_GCM_AES_XPN_256) ?
+		 32 :
+		 16;
+}
+
+static_always_inline u64
+sonic_ext_macsec_recover_xpn (u64 highest_seen, u32 pn_on_wire, u8 xpn_en)
+{
+  u32 hi, lo;
+
+  if (!xpn_en)
+    return pn_on_wire;
+
+  hi = (u32) (highest_seen >> 32);
+  lo = (u32) highest_seen;
+
+  /* 802.1AEbw: if the wire PN is far below the current low word, the
+   * 32-bit counter wrapped. */
+  if (pn_on_wire < lo && (lo - pn_on_wire) > (1u << 31))
+    hi++;
+  else if (pn_on_wire > lo && (pn_on_wire - lo) > (1u << 31) && hi > 0)
+    hi--;
+
+  return ((u64) hi << 32) | pn_on_wire;
+}
+
+static_always_inline void
+sonic_ext_macsec_build_iv (u8 *iv, const sonic_ext_macsec_sa_t *sa, u64 sci,
+			   u64 xpn)
+{
+  if (PREDICT_FALSE (sa->xpn_en))
+    {
+      u32 nssci = clib_host_to_net_u32 (sa->ssci);
+      u64 nxpn = clib_host_to_net_u64 (xpn);
+      u32 s0;
+      u64 s1;
+
+      clib_memcpy (&s0, sa->salt, sizeof (s0));
+      clib_memcpy (&s1, sa->salt + 4, sizeof (s1));
+      s0 ^= nssci;
+      s1 ^= nxpn;
+      clib_memcpy (iv, &s0, sizeof (s0));
+      clib_memcpy (iv + 4, &s1, sizeof (s1));
+      return;
+    }
+
   sonic_ext_macsec_sci_store (iv, sci);
-  u32 npn = clib_host_to_net_u32 (pn);
-  clib_memcpy (iv + 8, &npn, sizeof (npn));
+  {
+    u32 npn = clib_host_to_net_u32 ((u32) xpn);
+    clib_memcpy (iv + 8, &npn, sizeof (npn));
+  }
+}
+
+/* Sliding 128-bit window over recovered XPN. bit 0 = highest_seen. */
+static_always_inline int
+sonic_ext_macsec_replay_is_late (const sonic_ext_macsec_sc_t *sc, u64 xpn,
+				 u8 replay_protect, u32 replay_window)
+{
+  u64 highest, delta;
+  u32 window;
+
+  if (!replay_protect)
+    return 0;
+
+  highest = sc->highest_xpn_seen;
+  window = replay_window > 128 ? 128 : replay_window;
+
+  if (xpn > highest)
+    return 0;
+  if (window == 0 || (highest - xpn) >= window)
+    return 1;
+
+  delta = highest - xpn;
+  if (delta < 64)
+    return (sc->replay_bitmap_lo & (1ULL << delta)) != 0;
+  return (sc->replay_bitmap_hi & (1ULL << (delta - 64))) != 0;
+}
+
+static_always_inline void
+sonic_ext_macsec_replay_advance (sonic_ext_macsec_sc_t *sc, u64 xpn,
+				 u32 replay_window)
+{
+  u64 highest = sc->highest_xpn_seen;
+  u32 window = replay_window > 128 ? 128 : replay_window;
+
+  if (xpn > highest)
+    {
+      u64 shift = xpn - highest;
+
+      if (window == 0 || shift >= 128)
+	{
+	  sc->replay_bitmap_lo = 1ULL;
+	  sc->replay_bitmap_hi = 0;
+	}
+      else if (shift < 64)
+	{
+	  sc->replay_bitmap_hi =
+	    (sc->replay_bitmap_hi << shift) |
+	    (sc->replay_bitmap_lo >> (64 - (u8) shift));
+	  sc->replay_bitmap_lo = (sc->replay_bitmap_lo << shift) | 1ULL;
+	}
+      else
+	{
+	  sc->replay_bitmap_hi = sc->replay_bitmap_lo << (shift - 64);
+	  sc->replay_bitmap_lo = 1ULL;
+	}
+      sc->highest_xpn_seen = xpn;
+      return;
+    }
+
+  if (xpn < highest)
+    {
+      u64 delta = highest - xpn;
+
+      if (delta < 64)
+	sc->replay_bitmap_lo |= 1ULL << delta;
+      else if (delta < 128)
+	sc->replay_bitmap_hi |= 1ULL << (delta - 64);
+    }
 }
 
 #endif /* __included_sonic_ext_macsec_h__ */

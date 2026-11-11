@@ -290,7 +290,7 @@ sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 cipher,
 
   if (direction >= SONIC_EXT_MACSEC_N_DIR)
     return VNET_API_ERROR_INVALID_VALUE;
-  if (is_add && cipher != SONIC_EXT_MACSEC_CS_GCM_AES_128)
+  if (is_add && cipher > SONIC_EXT_MACSEC_CS_GCM_AES_XPN_256)
     return VNET_API_ERROR_INVALID_VALUE;
   if (is_add && conf_offset != 0)
     return VNET_API_ERROR_INVALID_VALUE;
@@ -378,12 +378,15 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
       return sonic_ext_macsec_sa_destroy (sc->sa_index[an]);
     }
 
-  if (xpn_en || sak_len != 16 || sak == 0)
+  if (sak == 0 ||
+      sak_len != sonic_ext_macsec_cipher_sak_len (sc->cipher) ||
+      (xpn_en ? 1 : 0) != sonic_ext_macsec_cipher_is_xpn (sc->cipher))
     return VNET_API_ERROR_INVALID_VALUE;
   if (sc->sa_index[an] != ~0)
     return VNET_API_ERROR_VALUE_EXIST;
 
-  ctx = vnet_crypto_ctx_create (VNET_CRYPTO_ALG_AES_128_GCM);
+  ctx = vnet_crypto_ctx_create (sak_len == 32 ? VNET_CRYPTO_ALG_AES_256_GCM :
+						      VNET_CRYPTO_ALG_AES_128_GCM);
   if (!ctx || !vnet_crypto_ctx_set_cipher_key (ctx, sak, sak_len) ||
       vnet_crypto_ctx_get_engine (ctx, VNET_CRYPTO_HANDLER_TYPE_SIMPLE) ==
 	VNET_CRYPTO_ENGINE_ID_NONE)
@@ -393,9 +396,10 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
       if (!mm->no_handler_logged)
 	{
 	  clib_warning (
-	    "sonic-ext macsec: no aes-128-gcm handler bound "
+	    "sonic-ext macsec: no aes-%u-gcm handler bound "
 	    "(install vpp-crypto-engines; native/openssl auto-load "
-	    "from vpp_crypto_engines/)");
+	    "from vpp_crypto_engines/)",
+	    sak_len == 32 ? 256 : 128);
 	  mm->no_handler_logged = 1;
 	}
       return VNET_API_ERROR_UNSPECIFIED;
@@ -405,7 +409,7 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
   sa_index = sa - mm->sas;
   sa->sc_index = sc - mm->scs;
   sa->an = an;
-  sa->xpn_en = 0;
+  sa->xpn_en = xpn_en ? 1 : 0;
   sa->sak_len = sak_len;
   if (salt)
     clib_memcpy (sa->salt, salt, SONIC_EXT_MACSEC_SALT_LEN);
