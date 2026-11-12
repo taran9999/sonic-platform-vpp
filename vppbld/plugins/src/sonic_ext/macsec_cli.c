@@ -41,6 +41,18 @@ sonic_ext_macsec_cipher_name (u8 cipher)
     }
 }
 
+static u64
+sonic_ext_macsec_sa_stat (u32 sa_index, u32 stat)
+{
+  vlib_simple_counter_main_t *cm = &sonic_ext_macsec_sa_stats[stat];
+
+  if (!cm->counters)
+    return 0;
+  if (sa_index >= vlib_simple_counter_n_counters (cm))
+    return 0;
+  return vlib_get_simple_counter (cm, sa_index);
+}
+
 static void
 sonic_ext_macsec_show_sa (vlib_main_t *vm, sonic_ext_macsec_sc_t *sc,
 			  sonic_ext_macsec_sa_t *sa, u32 sa_index)
@@ -48,10 +60,23 @@ sonic_ext_macsec_show_sa (vlib_main_t *vm, sonic_ext_macsec_sc_t *sc,
   vlib_cli_output (
     vm,
     "    sa %u an %u sak-len %u cipher %s xpn-en %u pn %llu lowest %llu "
-    "out-enc %llu in-ok %llu in-not-valid %llu in-late %llu",
+    "out-enc %llu in-ok %llu octets-enc %llu in-octets-dec %llu "
+    "in-not-valid %llu in-late %llu",
     sa_index, sa->an, sa->sak_len, sonic_ext_macsec_cipher_name (sc->cipher),
-    sa->xpn_en, sa->next_xpn, sa->lowest_acceptable_xpn, sa->out_pkts_encrypted,
-    sa->in_pkts_ok, sa->in_pkts_not_valid, sa->in_pkts_late);
+    sa->xpn_en, (unsigned long long) sa->next_xpn,
+    (unsigned long long) sa->lowest_acceptable_xpn,
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_OUT_PKTS_ENCRYPTED),
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_IN_PKTS_OK),
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_OCTETS_ENCRYPTED),
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_IN_OCTETS_DECRYPTED),
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_IN_PKTS_NOT_VALID),
+    (unsigned long long) sonic_ext_macsec_sa_stat (
+      sa_index, SONIC_EXT_MACSEC_STAT_IN_PKTS_LATE));
 }
 
 static void
@@ -162,4 +187,45 @@ VLIB_CLI_COMMAND (show_macsec_command, static) = {
   .path = "show macsec",
   .short_help = "show macsec [interface <intf>] [sa]",
   .function = show_macsec_command_fn,
+};
+
+static clib_error_t *
+clear_macsec_counters_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				  vlib_cli_command_t *cmd)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+  u32 sw_if_index = ~0;
+  sonic_ext_macsec_sa_t *sa;
+
+  (void) vm;
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "interface %U", unformat_vnet_sw_interface, vnm,
+		    &sw_if_index))
+	;
+      else
+	return clib_error_return (0, "unknown input `%U'", format_unformat_error,
+				  input);
+    }
+
+  if (sw_if_index == ~0)
+    {
+      sonic_ext_macsec_clear_stats_all ();
+      return 0;
+    }
+
+  pool_foreach (sa, mm->sas)
+    {
+      sonic_ext_macsec_sc_t *sc = sonic_ext_macsec_sc_get (sa->sc_index);
+      if (sc && sc->port_index == sw_if_index)
+	sonic_ext_macsec_sa_stats_zero (sa - mm->sas);
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (clear_macsec_counters_command, static) = {
+  .path = "clear macsec counters",
+  .short_help = "clear macsec counters [interface <intf>]",
+  .function = clear_macsec_counters_command_fn,
 };

@@ -17,6 +17,8 @@
 
 #include <sonic_ext/sonic_ext.h>
 #include <vnet/crypto/crypto.h>
+#include <vlib/counter.h>
+#include <vlib/stats/stats.h>
 #include <vppinfra/hash.h>
 
 #define SONIC_EXT_MACSEC_AN_MAX 4
@@ -46,6 +48,30 @@ enum
   SONIC_EXT_MACSEC_CS_GCM_AES_256,
   SONIC_EXT_MACSEC_CS_GCM_AES_XPN_128,
   SONIC_EXT_MACSEC_CS_GCM_AES_XPN_256,
+};
+
+#define foreach_sonic_ext_macsec_sa_stat                                      \
+  _ (OUT_PKTS_ENCRYPTED, "out-pkts-encrypted")                                \
+  _ (OUT_PKTS_PROTECTED, "out-pkts-protected")                                \
+  _ (OCTETS_ENCRYPTED, "octets-encrypted")                                    \
+  _ (OCTETS_PROTECTED, "octets-protected")                                    \
+  _ (IN_PKTS_OK, "in-pkts-ok")                                                \
+  _ (IN_PKTS_INVALID, "in-pkts-invalid")                                      \
+  _ (IN_PKTS_NOT_VALID, "in-pkts-not-valid")                                  \
+  _ (IN_PKTS_LATE, "in-pkts-late")                                            \
+  _ (IN_PKTS_DELAYED, "in-pkts-delayed")                                      \
+  _ (IN_PKTS_UNCHECKED, "in-pkts-unchecked")                                  \
+  _ (IN_PKTS_NOT_USING_SA, "in-pkts-not-using-sa")                            \
+  _ (IN_PKTS_UNUSED_SA, "in-pkts-unused-sa")                                  \
+  _ (IN_OCTETS_DECRYPTED, "in-octets-decrypted")                              \
+  _ (IN_OCTETS_VALIDATED, "in-octets-validated")
+
+enum
+{
+#define _(sym, name) SONIC_EXT_MACSEC_STAT_##sym,
+  foreach_sonic_ext_macsec_sa_stat
+#undef _
+    SONIC_EXT_MACSEC_N_SA_STATS,
 };
 
 /* SONiC reuses one chassis SCI on every protected port.  VPP must key
@@ -87,13 +113,15 @@ typedef struct
   u32 ssci;
   vnet_crypto_ctx_t *crypto_ctx;
   u64 next_xpn, lowest_acceptable_xpn;
-  u64 out_pkts_encrypted, out_pkts_protected;
-  u64 octets_encrypted, octets_protected;
-  u64 in_pkts_ok, in_pkts_not_valid, in_pkts_invalid;
-  u64 in_pkts_late, in_pkts_delayed, in_pkts_unchecked;
-  u64 in_pkts_not_using_sa, in_pkts_no_sa, in_pkts_unused_sa;
-  u64 in_octets_decrypted, in_octets_validated;
+  u32 xpn_gauge_index;
+  u32 stat_symlink_index[SONIC_EXT_MACSEC_N_SA_STATS];
 } sonic_ext_macsec_sa_t;
+
+typedef struct
+{
+  vnet_crypto_op_chunk_t *chunks;
+  u8 *scratch;
+} sonic_ext_macsec_per_thread_t;
 
 typedef struct
 {
@@ -105,11 +133,15 @@ typedef struct
   u32 *saved_mtu;
   u8 *mtu_is_hw;
   u8 no_handler_logged;
+  sonic_ext_macsec_per_thread_t *pt;
 } sonic_ext_macsec_main_t;
 
 extern sonic_ext_macsec_main_t sonic_ext_macsec_main;
 extern vlib_node_registration_t sonic_ext_macsec_encrypt_node;
 extern vlib_node_registration_t sonic_ext_macsec_decrypt_node;
+extern vlib_simple_counter_main_t
+  sonic_ext_macsec_sa_stats[SONIC_EXT_MACSEC_N_SA_STATS];
+extern const char *sonic_ext_macsec_sa_stat_names[SONIC_EXT_MACSEC_N_SA_STATS];
 
 int sonic_ext_macsec_port_add_del (u32 sw_if_index, u8 direction, u8 encrypt,
 				   u8 send_sci, u8 replay_protect,
@@ -120,10 +152,43 @@ int sonic_ext_macsec_sc_add_del (u32 sw_if_index, u8 direction, u64 sci,
 int sonic_ext_macsec_sc_set_encoding_an (u32 sw_if_index, u64 sci, u8 an);
 int sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 				 const u8 *sak, u8 sak_len, const u8 *salt,
-				 u32 ssci, u8 xpn_en, u64 init_xpn,
-				 int is_add);
+				 u32 ssci, u8 xpn_en, u64 init_xpn, int is_add,
+				 u32 *sa_index_out);
 int sonic_ext_macsec_sa_set_xpn (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 				 u64 xpn);
+int sonic_ext_macsec_sa_clear_stats (u32 sw_if_index, u8 direction, u64 sci,
+				     u8 an);
+int sonic_ext_macsec_clear_stats_all (void);
+void sonic_ext_macsec_sa_stats_bind (u32 sa_index);
+void sonic_ext_macsec_sa_stats_unbind (u32 sa_index);
+void sonic_ext_macsec_sa_stats_zero (u32 sa_index);
+sonic_ext_macsec_per_thread_t *sonic_ext_macsec_get_pt (vlib_main_t *vm);
+int sonic_ext_macsec_chain_copy_from (vlib_main_t *vm, vlib_buffer_t *b,
+				      u32 offset, u8 *dst, u32 len);
+int sonic_ext_macsec_chain_copy_to (vlib_main_t *vm, vlib_buffer_t *b,
+				    u32 offset, const u8 *src, u32 len);
+int sonic_ext_macsec_chain_append (vlib_main_t *vm, vlib_buffer_t *first,
+				   const u8 *data, u16 len);
+void sonic_ext_macsec_chain_trim_end (vlib_main_t *vm, vlib_buffer_t *first,
+				      u16 n);
+int sonic_ext_macsec_chain_user_chunks (vlib_main_t *vm, vlib_buffer_t *b,
+					u32 skip_head, u32 skip_tail,
+					vnet_crypto_op_chunk_t **chunks,
+					u8 **auth);
+
+static_always_inline void
+sonic_ext_macsec_sa_inc (u32 thread_index, u32 sa_index, u32 stat, u64 n)
+{
+  vlib_increment_simple_counter (&sonic_ext_macsec_sa_stats[stat],
+				 thread_index, sa_index, n);
+}
+
+static_always_inline void
+sonic_ext_macsec_sa_publish_xpn (sonic_ext_macsec_sa_t *sa)
+{
+  if (sa && sa->xpn_gauge_index != ~0)
+    vlib_stats_set_gauge (sa->xpn_gauge_index, sa->next_xpn);
+}
 
 static_always_inline sonic_ext_macsec_port_t *
 sonic_ext_macsec_port_get (u32 sw_if_index, u8 direction)

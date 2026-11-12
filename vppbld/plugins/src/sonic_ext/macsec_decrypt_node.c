@@ -91,11 +91,20 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
   u32 dec_slots[VLIB_FRAME_SIZE];
   sonic_ext_macsec_sa_t *dec_sas[VLIB_FRAME_SIZE];
   sonic_ext_macsec_sc_t *dec_scs[VLIB_FRAME_SIZE];
+  u32 dec_sa_index[VLIB_FRAME_SIZE];
+  u32 dec_user_len[VLIB_FRAME_SIZE];
+  u8 dec_linear[VLIB_FRAME_SIZE];
+  u32 dec_scratch_off[VLIB_FRAME_SIZE];
   u8 sectag_lens[VLIB_FRAME_SIZE];
   u64 xpns[VLIB_FRAME_SIZE];
+  sonic_ext_macsec_per_thread_t *ptd = sonic_ext_macsec_get_pt (vm);
+  u32 thread_index = vm->thread_index;
   u32 n_dec = 0;
   u32 n_errors[SONIC_EXT_MACSEC_DECRYPT_N_ERROR] = { 0 };
   u32 i;
+  u32 scratch_used = 0;
+
+  vec_reset_length (ptd->chunks);
 
   from = vlib_frame_vector_args (frame);
   n_left_from = frame->n_vectors;
@@ -151,18 +160,9 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  goto done0;
 	}
 
-      if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_NEXT_PRESENT))
-	{
-	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
-	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED];
-	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED]++;
-	  dropped = 1;
-	  goto done0;
-	}
-
       p = (u8 *) eth;
-      if (PREDICT_FALSE (b[0]->current_length < 12 + SONIC_EXT_MACSEC_SECTAG_NO_SCI +
-			 SONIC_EXT_MACSEC_ICV_LEN))
+      if (PREDICT_FALSE (b[0]->current_length <
+			 12 + SONIC_EXT_MACSEC_SECTAG_NO_SCI))
 	{
 	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
 	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_SHORT];
@@ -176,7 +176,8 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       send_sci = (tci & SONIC_EXT_MACSEC_TCI_SC) ? 1 : 0;
       sectag_len = sonic_ext_macsec_sectag_len (send_sci);
       need = 12 + sectag_len + SONIC_EXT_MACSEC_ICV_LEN;
-      if (PREDICT_FALSE (b[0]->current_length < need))
+      if (PREDICT_FALSE (b[0]->current_length < 12 + sectag_len ||
+			 vlib_buffer_length_in_chain (vm, b[0]) < need))
 	{
 	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
 	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_SHORT];
@@ -233,28 +234,89 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
 	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_LATE];
 	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_LATE]++;
-	  clib_atomic_fetch_add (&sa->in_pkts_late, 1);
+	  sonic_ext_macsec_sa_inc (thread_index, sa_index,
+				   SONIC_EXT_MACSEC_STAT_IN_PKTS_LATE, 1);
 	  dropped = 1;
 	  goto done0;
 	}
 
       secure = p + 12 + sectag_len;
-      secure_len = b[0]->current_length - 12 - sectag_len - SONIC_EXT_MACSEC_ICV_LEN;
+      secure_len = vlib_buffer_length_in_chain (vm, b[0]) - 12 - sectag_len -
+		   SONIC_EXT_MACSEC_ICV_LEN;
       sonic_ext_macsec_build_iv (ivs[n_dec], sa, sci, xpn);
       vnet_crypto_op_init (sa->crypto_ctx, &ops[n_dec]);
       ops[n_dec].type = VNET_CRYPTO_OP_TYPE_DECRYPT;
       ops[n_dec].flags = VNET_CRYPTO_OP_FLAG_HMAC_CHECK;
-      ops[n_dec].src = ops[n_dec].dst = secure;
-      ops[n_dec].len = secure_len;
       ops[n_dec].iv = ivs[n_dec];
       ops[n_dec].aad = p;
       ops[n_dec].aad_len = 12 + sectag_len;
-      ops[n_dec].auth = secure + secure_len;
       ops[n_dec].auth_len = SONIC_EXT_MACSEC_ICV_LEN;
       ops[n_dec].user_data = slot;
+      dec_linear[n_dec] = 0;
+      dec_scratch_off[n_dec] = 0;
+
+      if (PREDICT_TRUE (!(b[0]->flags & VLIB_BUFFER_NEXT_PRESENT)))
+	{
+	  ops[n_dec].src = ops[n_dec].dst = secure;
+	  ops[n_dec].len = secure_len;
+	  ops[n_dec].auth = secure + secure_len;
+	}
+      else if (vnet_crypto_ctx_get_engine (
+		 sa->crypto_ctx, VNET_CRYPTO_HANDLER_TYPE_CHAINED) !=
+		 VNET_CRYPTO_ENGINE_ID_NONE)
+	{
+	  vlib_buffer_t *last = 0;
+	  u8 *auth = 0;
+	  int n_ch;
+
+	  vlib_buffer_length_in_chain_lb (vm, b[0], &last, 0);
+	  if (!last || last->current_length < SONIC_EXT_MACSEC_ICV_LEN)
+	    goto linearize_dec;
+	  ops[n_dec].flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
+	  ops[n_dec].chunk_index = vec_len (ptd->chunks);
+	  n_ch = sonic_ext_macsec_chain_user_chunks (
+	    vm, b[0], 12 + sectag_len, SONIC_EXT_MACSEC_ICV_LEN, &ptd->chunks,
+	    &auth);
+	  if (n_ch <= 0 || !auth)
+	    {
+	      next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
+	      b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED];
+	      n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED]++;
+	      dropped = 1;
+	      goto done0;
+	    }
+	  ops[n_dec].n_chunks = (u16) n_ch;
+	  ops[n_dec].auth = auth;
+	}
+      else
+	{
+	linearize_dec:
+	  dec_linear[n_dec] = 1;
+	  dec_scratch_off[n_dec] = scratch_used;
+	  vec_validate (ptd->scratch,
+			scratch_used + secure_len + SONIC_EXT_MACSEC_ICV_LEN);
+	  if (sonic_ext_macsec_chain_copy_from (
+		vm, b[0], 12 + sectag_len, ptd->scratch + scratch_used,
+		secure_len + SONIC_EXT_MACSEC_ICV_LEN))
+	    {
+	      next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
+	      b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED];
+	      n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED]++;
+	      dropped = 1;
+	      goto done0;
+	    }
+	  ops[n_dec].src = ops[n_dec].dst = ptd->scratch + scratch_used;
+	  ops[n_dec].len = secure_len;
+	  ops[n_dec].auth =
+	    ptd->scratch + scratch_used + secure_len;
+	  scratch_used += secure_len + SONIC_EXT_MACSEC_ICV_LEN;
+	}
+
       dec_slots[n_dec] = slot;
       dec_sas[n_dec] = sa;
       dec_scs[n_dec] = sc;
+      dec_sa_index[n_dec] = sa_index;
+      dec_user_len[n_dec] = secure_len;
       sectag_lens[n_dec] = sectag_len;
       xpns[n_dec] = xpn;
       n_dec++;
@@ -285,7 +347,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
     }
 
   if (n_dec)
-    vnet_crypto_process_ops (vm, ops, 0, n_dec);
+    vnet_crypto_process_ops (vm, ops, ptd->chunks, n_dec);
 
   for (i = 0; i < n_dec; i++)
     {
@@ -297,6 +359,8 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       sonic_ext_macsec_port_t *port;
       u8 sectag_len = sectag_lens[i];
       u64 xpn = xpns[i];
+      u32 sa_idx = dec_sa_index[i];
+      u32 user_len = dec_user_len[i];
       u8 *p;
 
       if (PREDICT_FALSE (ops[i].status != VNET_CRYPTO_OP_STATUS_COMPLETED))
@@ -304,14 +368,26 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  nexts[slot] = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
 	  b0->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_NOT_VALID];
 	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_NOT_VALID]++;
-	  clib_atomic_fetch_add (&sa->in_pkts_not_valid, 1);
+	  sonic_ext_macsec_sa_inc (thread_index, sa_idx,
+				   SONIC_EXT_MACSEC_STAT_IN_PKTS_NOT_VALID, 1);
+	  continue;
+	}
+
+      if (dec_linear[i] &&
+	  sonic_ext_macsec_chain_copy_to (vm, b0, 12 + sectag_len,
+					  ptd->scratch + dec_scratch_off[i],
+					  user_len))
+	{
+	  nexts[slot] = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
+	  b0->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED];
+	  n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_CHAINED]++;
 	  continue;
 	}
 
       p = vlib_buffer_get_current (b0);
       clib_memmove (p + sectag_len, p, 12);
       vlib_buffer_advance (b0, sectag_len);
-      b0->current_length -= SONIC_EXT_MACSEC_ICV_LEN;
+      sonic_ext_macsec_chain_trim_end (vm, b0, SONIC_EXT_MACSEC_ICV_LEN);
 
       port = sonic_ext_macsec_port_get (vnet_buffer (b0)->sw_if_index[VLIB_RX],
 				       SONIC_EXT_MACSEC_INGRESS);
@@ -319,9 +395,13 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	sc, xpn, port ? port->replay_window : 0);
       if (xpn + 1 > sa->next_xpn)
 	clib_atomic_store_rel_n (&sa->next_xpn, xpn + 1);
+      sonic_ext_macsec_sa_publish_xpn (sa);
 
-      clib_atomic_fetch_add (&sa->in_pkts_ok, 1);
-      clib_atomic_fetch_add (&sa->in_octets_decrypted, b0->current_length);
+      sonic_ext_macsec_sa_inc (thread_index, sa_idx,
+			       SONIC_EXT_MACSEC_STAT_IN_PKTS_OK, 1);
+      sonic_ext_macsec_sa_inc (thread_index, sa_idx,
+			       SONIC_EXT_MACSEC_STAT_IN_OCTETS_DECRYPTED,
+			       user_len);
       vnet_feature_next (&next0, b0);
       nexts[slot] = (u16) next0;
       n_errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_OK]++;

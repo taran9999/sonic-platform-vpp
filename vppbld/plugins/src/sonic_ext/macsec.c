@@ -24,6 +24,7 @@
 
 #include <vlib/vlib.h>
 #include <vlib/threads.h>
+#include <vlib/stats/stats.h>
 #include <vnet/vnet.h>
 #include <vnet/feature/feature.h>
 #include <vnet/interface.h>
@@ -31,6 +32,300 @@
 #include <vppinfra/mem.h>
 
 sonic_ext_macsec_main_t sonic_ext_macsec_main;
+
+const char *sonic_ext_macsec_sa_stat_names[SONIC_EXT_MACSEC_N_SA_STATS] = {
+#define _(sym, name) name,
+  foreach_sonic_ext_macsec_sa_stat
+#undef _
+};
+
+vlib_simple_counter_main_t
+  sonic_ext_macsec_sa_stats[SONIC_EXT_MACSEC_N_SA_STATS];
+
+static void
+sonic_ext_macsec_sa_stats_init (void)
+{
+  u32 i;
+
+  for (i = 0; i < SONIC_EXT_MACSEC_N_SA_STATS; i++)
+    {
+      sonic_ext_macsec_sa_stats[i].name =
+	(char *) sonic_ext_macsec_sa_stat_names[i];
+      sonic_ext_macsec_sa_stats[i].stat_segment_name = (char *) format (
+	0, "/macsec/sa/%s%c", sonic_ext_macsec_sa_stat_names[i], 0);
+    }
+}
+
+void
+sonic_ext_macsec_sa_stats_zero (u32 sa_index)
+{
+  u32 i;
+
+  for (i = 0; i < SONIC_EXT_MACSEC_N_SA_STATS; i++)
+    {
+      if (sa_index < vlib_simple_counter_n_counters (&sonic_ext_macsec_sa_stats[i]))
+	vlib_zero_simple_counter (&sonic_ext_macsec_sa_stats[i], sa_index);
+    }
+}
+
+void
+sonic_ext_macsec_sa_stats_bind (u32 sa_index)
+{
+  sonic_ext_macsec_sa_t *sa = sonic_ext_macsec_sa_get (sa_index);
+  u32 i;
+
+  if (!sa)
+    return;
+
+  for (i = 0; i < SONIC_EXT_MACSEC_N_SA_STATS; i++)
+    {
+      vlib_validate_simple_counter (&sonic_ext_macsec_sa_stats[i], sa_index);
+      vlib_zero_simple_counter (&sonic_ext_macsec_sa_stats[i], sa_index);
+      sa->stat_symlink_index[i] = vlib_stats_add_symlink (
+	sonic_ext_macsec_sa_stats[i].stats_entry_index, sa_index,
+	"/macsec/sa/%u/%s", sa_index, sonic_ext_macsec_sa_stat_names[i]);
+    }
+
+  sa->xpn_gauge_index =
+    vlib_stats_add_gauge ("/macsec/sa/%u/current-xpn", sa_index);
+  sonic_ext_macsec_sa_publish_xpn (sa);
+}
+
+void
+sonic_ext_macsec_sa_stats_unbind (u32 sa_index)
+{
+  sonic_ext_macsec_sa_t *sa = sonic_ext_macsec_sa_get (sa_index);
+  u32 i;
+
+  if (!sa)
+    return;
+
+  for (i = 0; i < SONIC_EXT_MACSEC_N_SA_STATS; i++)
+    {
+      if (sa->stat_symlink_index[i] != ~0 &&
+	  sa->stat_symlink_index[i] != STAT_SEGMENT_INDEX_INVALID)
+	{
+	  vlib_stats_remove_entry (sa->stat_symlink_index[i]);
+	  sa->stat_symlink_index[i] = ~0;
+	}
+    }
+  if (sa->xpn_gauge_index != ~0 &&
+      sa->xpn_gauge_index != STAT_SEGMENT_INDEX_INVALID)
+    {
+      vlib_stats_remove_entry (sa->xpn_gauge_index);
+      sa->xpn_gauge_index = ~0;
+    }
+  sonic_ext_macsec_sa_stats_zero (sa_index);
+}
+
+int
+sonic_ext_macsec_sa_clear_stats (u32 sw_if_index, u8 direction, u64 sci, u8 an)
+{
+  sonic_ext_macsec_sc_t *sc;
+  u32 sa_index;
+
+  if (direction >= SONIC_EXT_MACSEC_N_DIR || an >= SONIC_EXT_MACSEC_AN_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  sc = sonic_ext_macsec_sc_by_sci (sw_if_index, sci, direction);
+  if (!sc)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+  sa_index = sc->sa_index[an];
+  if (sa_index == ~0 || !sonic_ext_macsec_sa_get (sa_index))
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+  sonic_ext_macsec_sa_stats_zero (sa_index);
+  return 0;
+}
+
+int
+sonic_ext_macsec_clear_stats_all (void)
+{
+  sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+  sonic_ext_macsec_sa_t *sa;
+
+  pool_foreach (sa, mm->sas)
+    sonic_ext_macsec_sa_stats_zero (sa - mm->sas);
+  return 0;
+}
+
+sonic_ext_macsec_per_thread_t *
+sonic_ext_macsec_get_pt (vlib_main_t *vm)
+{
+  sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
+
+  vec_validate (mm->pt, vm->thread_index);
+  return vec_elt_at_index (mm->pt, vm->thread_index);
+}
+
+int
+sonic_ext_macsec_chain_copy_from (vlib_main_t *vm, vlib_buffer_t *b,
+				  u32 offset, u8 *dst, u32 len)
+{
+  while (b && len)
+    {
+      if (offset >= b->current_length)
+	{
+	  offset -= b->current_length;
+	  if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    return -1;
+	  b = vlib_get_buffer (vm, b->next_buffer);
+	  continue;
+	}
+      {
+	u32 n = b->current_length - offset;
+	if (n > len)
+	  n = len;
+	clib_memcpy (dst, vlib_buffer_get_current (b) + offset, n);
+	dst += n;
+	len -= n;
+	offset = 0;
+      }
+      if (len)
+	{
+	  if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    return -1;
+	  b = vlib_get_buffer (vm, b->next_buffer);
+	}
+    }
+  return len ? -1 : 0;
+}
+
+int
+sonic_ext_macsec_chain_copy_to (vlib_main_t *vm, vlib_buffer_t *b, u32 offset,
+				const u8 *src, u32 len)
+{
+  while (b && len)
+    {
+      if (offset >= b->current_length)
+	{
+	  offset -= b->current_length;
+	  if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    return -1;
+	  b = vlib_get_buffer (vm, b->next_buffer);
+	  continue;
+	}
+      {
+	u32 n = b->current_length - offset;
+	if (n > len)
+	  n = len;
+	clib_memcpy (vlib_buffer_get_current (b) + offset, src, n);
+	src += n;
+	len -= n;
+	offset = 0;
+      }
+      if (len)
+	{
+	  if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    return -1;
+	  b = vlib_get_buffer (vm, b->next_buffer);
+	}
+    }
+  return len ? -1 : 0;
+}
+
+int
+sonic_ext_macsec_chain_append (vlib_main_t *vm, vlib_buffer_t *first,
+			       const u8 *data, u16 len)
+{
+  vlib_buffer_t *last = 0;
+  u16 n;
+
+  vlib_buffer_length_in_chain_lb (vm, first, &last, 0);
+  if (!last)
+    return -1;
+  /* Keep the trailer contiguous so AES-GCM ICV has a single auth pointer. */
+  if (vlib_buffer_space_left_at_end (vm, last) < len)
+    {
+      u32 bi;
+
+      if (1 != vlib_buffer_alloc_from_pool (vm, &bi, 1, first->buffer_pool_index))
+	return -1;
+      last = vlib_buffer_chain_buffer (vm, last, bi);
+      first->flags |= VLIB_BUFFER_TOTAL_LENGTH_VALID;
+    }
+  n = vlib_buffer_chain_append_data (vm, first, last, (void *) data, len);
+  return n == len ? 0 : -1;
+}
+
+void
+sonic_ext_macsec_chain_trim_end (vlib_main_t *vm, vlib_buffer_t *first, u16 n)
+{
+  vlib_buffer_t *b = first;
+  u32 total, keep, off = 0;
+
+  total = vlib_buffer_length_in_chain (vm, first);
+  if (total < n)
+    n = (u16) total;
+  keep = total - n;
+
+  while (b)
+    {
+      u32 next_off = off + b->current_length;
+      if (next_off > keep)
+	{
+	  u32 new_len = keep > off ? keep - off : 0;
+	  if (first != b && (first->flags & VLIB_BUFFER_TOTAL_LENGTH_VALID) &&
+	      b->current_length > new_len)
+	    first->total_length_not_including_first_buffer -=
+	      (b->current_length - new_len);
+	  b->current_length = new_len;
+	}
+      off = next_off;
+      if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	break;
+      b = vlib_get_buffer (vm, b->next_buffer);
+    }
+}
+
+int
+sonic_ext_macsec_chain_user_chunks (vlib_main_t *vm, vlib_buffer_t *b,
+				    u32 skip_head, u32 skip_tail,
+				    vnet_crypto_op_chunk_t **chunks, u8 **auth)
+{
+  u32 total = vlib_buffer_length_in_chain (vm, b);
+  u32 user_end, off = 0;
+  u16 n_ch = 0;
+  u8 *auth_ptr = 0;
+
+  if (total < skip_head + skip_tail)
+    return -1;
+  user_end = total - skip_tail;
+
+  while (b)
+    {
+      u32 abs_start = off;
+      u32 abs_end = off + b->current_length;
+
+      if (abs_end > skip_head && abs_start < user_end)
+	{
+	  u32 u0 = skip_head > abs_start ? skip_head - abs_start : 0;
+	  u32 u1 = user_end < abs_end ? user_end - abs_start : b->current_length;
+	  if (u1 > u0)
+	    {
+	      vnet_crypto_op_chunk_t *ch;
+	      vec_add2 (*chunks, ch, 1);
+	      ch->src = ch->dst = (u8 *) vlib_buffer_get_current (b) + u0;
+	      ch->len = u1 - u0;
+	      n_ch++;
+	    }
+	}
+      if (skip_tail && abs_end > user_end && abs_start < total && !auth_ptr)
+	{
+	  u32 i0 = user_end > abs_start ? user_end - abs_start : 0;
+	  auth_ptr = (u8 *) vlib_buffer_get_current (b) + i0;
+	}
+
+      off += b->current_length;
+      if (!(b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	break;
+      b = vlib_get_buffer (vm, b->next_buffer);
+    }
+
+  if (auth)
+    *auth = auth_ptr;
+  return n_ch;
+}
 
 static const char *
 sonic_ext_macsec_node_name (u8 direction)
@@ -203,6 +498,7 @@ sonic_ext_macsec_sa_destroy (u32 sa_index)
       vnet_crypto_ctx_destroy (vm, sa->crypto_ctx);
       sa->crypto_ctx = 0;
     }
+  sonic_ext_macsec_sa_stats_unbind (sa_index);
   pool_put (mm->sas, sa);
   vlib_worker_thread_barrier_release (vm);
   return 0;
@@ -356,13 +652,17 @@ sonic_ext_macsec_sc_set_encoding_an (u32 sw_if_index, u64 sci, u8 an)
 int
 sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 			     const u8 *sak, u8 sak_len, const u8 *salt, u32 ssci,
-			     u8 xpn_en, u64 init_xpn, int is_add)
+			     u8 xpn_en, u64 init_xpn, int is_add,
+			     u32 *sa_index_out)
 {
   sonic_ext_macsec_main_t *mm = &sonic_ext_macsec_main;
   sonic_ext_macsec_sc_t *sc;
   sonic_ext_macsec_sa_t *sa;
   vnet_crypto_ctx_t *ctx;
   u32 sa_index;
+
+  if (sa_index_out)
+    *sa_index_out = ~0;
 
   if (direction >= SONIC_EXT_MACSEC_N_DIR || an >= SONIC_EXT_MACSEC_AN_MAX)
     return VNET_API_ERROR_INVALID_VALUE;
@@ -417,7 +717,16 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
   sa->crypto_ctx = ctx;
   sa->next_xpn = init_xpn ? init_xpn : 1;
   sa->lowest_acceptable_xpn = sa->next_xpn;
+  sa->xpn_gauge_index = ~0;
+  {
+    u32 i;
+    for (i = 0; i < SONIC_EXT_MACSEC_N_SA_STATS; i++)
+      sa->stat_symlink_index[i] = ~0;
+  }
+  sonic_ext_macsec_sa_stats_bind (sa_index);
   clib_atomic_store_rel_n (&sc->sa_index[an], sa_index);
+  if (sa_index_out)
+    *sa_index_out = sa_index;
   return 0;
 }
 
@@ -440,6 +749,7 @@ sonic_ext_macsec_sa_set_xpn (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 
   clib_atomic_store_rel_n (&sa->next_xpn, xpn);
   clib_atomic_store_rel_n (&sa->lowest_acceptable_xpn, xpn);
+  sonic_ext_macsec_sa_publish_xpn (sa);
   return 0;
 }
 
@@ -470,6 +780,7 @@ sonic_ext_macsec_init (vlib_main_t *vm)
   (void) vm;
   clib_memset (&sonic_ext_macsec_main, 0, sizeof (sonic_ext_macsec_main));
   sonic_ext_macsec_ensure_hash ();
+  sonic_ext_macsec_sa_stats_init ();
   return 0;
 }
 

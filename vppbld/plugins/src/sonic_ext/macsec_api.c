@@ -109,18 +109,17 @@ vl_api_sonic_ext_macsec_sa_add_del_t_handler (
 {
   vl_api_sonic_ext_macsec_sa_add_del_reply_t *rmp;
   u32 sw_if_index = ntohl (mp->sw_if_index);
+  u32 sa_index = ~0;
   int rv = sonic_ext_macsec_api_check (sw_if_index);
 
-  if (rv)
-    goto done;
+  if (!rv)
+    rv = sonic_ext_macsec_sa_add_del (
+      sw_if_index, mp->direction, clib_net_to_host_u64 (mp->sci), mp->an,
+      mp->sak, mp->sak_len, mp->salt, ntohl (mp->ssci), mp->xpn_en,
+      clib_net_to_host_u64 (mp->init_xpn), mp->is_add ? 1 : 0, &sa_index);
 
-  rv = sonic_ext_macsec_sa_add_del (
-    sw_if_index, mp->direction, clib_net_to_host_u64 (mp->sci), mp->an, mp->sak,
-    mp->sak_len, mp->salt, ntohl (mp->ssci), mp->xpn_en,
-    clib_net_to_host_u64 (mp->init_xpn), mp->is_add ? 1 : 0);
-
-done:
-  REPLY_MACRO (VL_API_SONIC_EXT_MACSEC_SA_ADD_DEL_REPLY);
+  REPLY_MACRO2 (VL_API_SONIC_EXT_MACSEC_SA_ADD_DEL_REPLY,
+		({ rmp->sa_index = htonl (sa_index); }));
 }
 
 static void
@@ -140,6 +139,24 @@ vl_api_sonic_ext_macsec_sa_set_xpn_t_handler (
 
 done:
   REPLY_MACRO (VL_API_SONIC_EXT_MACSEC_SA_SET_XPN_REPLY);
+}
+
+static void
+vl_api_sonic_ext_macsec_sa_clear_stats_t_handler (
+  vl_api_sonic_ext_macsec_sa_clear_stats_t *mp)
+{
+  vl_api_sonic_ext_macsec_sa_clear_stats_reply_t *rmp;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+  int rv = sonic_ext_macsec_api_check (sw_if_index);
+
+  if (rv)
+    goto done;
+
+  rv = sonic_ext_macsec_sa_clear_stats (
+    sw_if_index, mp->direction, clib_net_to_host_u64 (mp->sci), mp->an);
+
+done:
+  REPLY_MACRO (VL_API_SONIC_EXT_MACSEC_SA_CLEAR_STATS_REPLY);
 }
 
 #include <sonic_ext/sonic_ext_macsec.api.c>

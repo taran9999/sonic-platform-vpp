@@ -7,6 +7,7 @@ EAPOL (0x888E) must pass a protected port unmodified. LACP (0x8809)
 is on the controlled port and is MACsec-encapsulated.
 """
 
+import re
 import struct
 import unittest
 
@@ -36,6 +37,8 @@ CS_GCM_AES_XPN_128 = 2
 CS_GCM_AES_XPN_256 = 3
 DIR_EGRESS = 0
 DIR_INGRESS = 1
+# Explicit-SCI SecTAG (16) + ICV (16).
+MACSEC_OVERHEAD_SCI = 32
 
 
 def _aes_gcm_encrypt(key, iv, aad, plaintext):
@@ -203,7 +206,7 @@ class SonicExtMacsecBase(VppTestCase):
     ):
         if salt is None:
             salt = bytes(12)
-        self.vapi.sonic_ext_macsec_sa_add_del(
+        r = self.vapi.sonic_ext_macsec_sa_add_del(
             sw_if_index=sw_if_index,
             direction=direction,
             sci=sci,
@@ -220,6 +223,7 @@ class SonicExtMacsecBase(VppTestCase):
             self.vapi.sonic_ext_macsec_sc_set_encoding_an(
                 sw_if_index=sw_if_index, sci=sci, an=an
             )
+        return getattr(r, "sa_index", None)
 
     def del_sa(self, sw_if_index, direction, an=0, sci=TEST_SCI):
         self.vapi.sonic_ext_macsec_sa_add_del(
@@ -695,6 +699,126 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
             raw(pkt), TEST_SAK, TEST_SCI, an=1, pn=2, send_sci=True
         )
         self.assertEqual(raw(rx)[: len(expected)], expected)
+
+    def _sa_cli_field(self, name):
+        out = self.vapi.cli("show macsec sa")
+        vals = [int(v) for v in re.findall(r"%s (\d+)" % name, out)]
+        self.assertTrue(vals, out)
+        return vals
+
+    def jumbo_pkt(self):
+        return (
+            Ether(dst=self.pg1.local_mac, src=self.pg0.remote_mac)
+            / IP(src="10.0.0.1", dst="10.0.0.2", ttl=64)
+            / UDP(sport=1234, dport=4321)
+            / Raw(b"J" * 4000)
+        )
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the counter datapath")
+    def test_egress_counters_and_xpn(self):
+        """out-enc / XPN / User Data octets advance after N encrypted frames"""
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS)
+        pkt = self.data_pkt()
+        user_len = len(raw(pkt)) - 12
+        n = 5
+        for _ in range(n):
+            rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+            self.assertEqual(int.from_bytes(raw(rx)[12:14], "big"), MACSEC_ETHERTYPE)
+        out = self.vapi.cli("show macsec sa")
+        self.assertRegex(out, r"out-enc %u" % n)
+        self.assertRegex(out, r"octets-enc %u" % (n * user_len))
+        self.assertEqual(self._sa_cli_field("pn"), [1 + n])
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the counter datapath")
+    def test_ingress_counters_and_xpn(self):
+        """in-ok / XPN / User Data octets advance after N decrypted frames"""
+        pkt = self.data_pkt()
+        user_len = len(raw(pkt)) - 12
+        n = 5
+        self.add_secy(self.pg0.sw_if_index, DIR_INGRESS)
+        for i in range(n):
+            protected = macsec_protect(
+                raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=i + 1, send_sci=True
+            )
+            rx = self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)[0]
+            self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        out = self.vapi.cli("show macsec sa")
+        self.assertRegex(out, r"in-ok %u" % n)
+        self.assertRegex(out, r"in-octets-dec %u" % (n * user_len))
+        self.assertEqual(self._sa_cli_field("pn"), [1 + n])
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the counter datapath")
+    def test_clear_stats_leaves_pn(self):
+        """clear macsec counters zeros STAT_* and leaves PN"""
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS)
+        pkt = self.data_pkt()
+        self.send_and_expect(self.pg0, [pkt], self.pg1)
+        before = self.vapi.cli("show macsec sa")
+        self.assertRegex(before, r"out-enc 1")
+        self.assertRegex(before, r"pn 2")
+        self.vapi.cli("clear macsec counters")
+        after = self.vapi.cli("show macsec sa")
+        self.assertRegex(after, r"out-enc 0")
+        self.assertRegex(after, r"octets-enc 0")
+        self.assertRegex(after, r"pn 2")
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build replay frames")
+    def test_replay_late_bumps_in_pkts_late(self):
+        """replay duplicate still bumps in-pkts-late after the counter move"""
+        pkt = self.data_pkt()
+        protected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=1, send_sci=True
+        )
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            replay_protect=1,
+            replay_window=0,
+        )
+        self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)
+        self.send_and_assert_no_replies(self.pg0, [self.wire_pkt(protected)])
+        sa_out = self.vapi.cli("show macsec sa")
+        self.assertRegex(sa_out, r"in-late 1")
+        self.assertRegex(sa_out, r"in-ok 1")
+
+    def test_encrypt_jumbo_chained(self):
+        """payload larger than one vlib_buffer is forwarded, not CHAINED-dropped"""
+        self.add_secy(self.pg1.sw_if_index, DIR_EGRESS)
+        pkt = self.jumbo_pkt()
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-encrypt/dropped: chained buffer"
+        )
+        rx = self.send_and_expect(self.pg0, [pkt], self.pg1)[0]
+        got = raw(rx)
+        self.assertEqual(int.from_bytes(got[12:14], "big"), MACSEC_ETHERTYPE)
+        self.assertGreaterEqual(len(got), len(raw(pkt)) + MACSEC_OVERHEAD_SCI)
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-encrypt/dropped: chained buffer"
+            ),
+            before,
+        )
+        self.assertRegex(self.vapi.cli("show macsec sa"), r"out-enc 1")
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build a jumbo MACsec frame")
+    def test_decrypt_jumbo_chained(self):
+        """chained ciphertext decrypts instead of hitting the CHAINED drop"""
+        pkt = self.jumbo_pkt()
+        protected = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=1, send_sci=True
+        )
+        self.add_secy(self.pg0.sw_if_index, DIR_INGRESS)
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-decrypt/dropped: chained buffer"
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(protected)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: chained buffer"
+            ),
+            before,
+        )
 
 
 if __name__ == "__main__":

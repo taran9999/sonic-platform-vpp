@@ -22,7 +22,7 @@
     matching other VPP APIs.  SAK material is never logged or shown.
 */
 
-option version = "1.0.0";
+option version = "1.1.0";
 
 import "vnet/interface_types.api";
 
@@ -87,8 +87,9 @@ autoreply define sonic_ext_macsec_sc_set_encoding_an
     @param ssci - XPN SSCI (host-order u32 on the call); unused when xpn_en is 0
     @param xpn_en - 1 for XPN ciphers; must match cipher_suite
     @param init_xpn - next PN; 0 is treated as 1
+    @param sa_index - VPP SA pool index on add (reply); ~0 on delete/failure
 */
-autoreply define sonic_ext_macsec_sa_add_del
+define sonic_ext_macsec_sa_add_del
 {
   u32 client_index;
   u32 context;
@@ -105,6 +106,13 @@ autoreply define sonic_ext_macsec_sa_add_del
   bool is_add;
 };
 
+define sonic_ext_macsec_sa_add_del_reply
+{
+  u32 context;
+  i32 retval;
+  u32 sa_index;
+};
+
 /** \brief Set CURRENT/configured XPN on an SA. */
 autoreply define sonic_ext_macsec_sa_set_xpn
 {
@@ -115,4 +123,15 @@ autoreply define sonic_ext_macsec_sa_set_xpn
   u64 sci;
   u8 an;
   u64 xpn;
+};
+
+/** \brief Zero STAT_* simple counters for one SA. Does not change XPN. */
+autoreply define sonic_ext_macsec_sa_clear_stats
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u8 direction;
+  u64 sci;
+  u8 an;
 };
