@@ -90,7 +90,6 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
   u8 ivs[VLIB_FRAME_SIZE][SONIC_EXT_MACSEC_IV_LEN];
   u32 dec_slots[VLIB_FRAME_SIZE];
   sonic_ext_macsec_sa_t *dec_sas[VLIB_FRAME_SIZE];
-  sonic_ext_macsec_sc_t *dec_scs[VLIB_FRAME_SIZE];
   u32 dec_sa_index[VLIB_FRAME_SIZE];
   u32 dec_user_len[VLIB_FRAME_SIZE];
   u8 dec_linear[VLIB_FRAME_SIZE];
@@ -225,11 +224,11 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 	  goto done0;
 	}
 
-      xpn = sonic_ext_macsec_recover_xpn (sc->highest_xpn_seen, pn, sa->xpn_en);
+      xpn = sonic_ext_macsec_recover_xpn (sa->highest_xpn_seen, pn, sa->xpn_en);
       if (PREDICT_FALSE (port->replay_protect &&
 			 (xpn < sa->lowest_acceptable_xpn ||
 			  sonic_ext_macsec_replay_is_late (
-			    sc, xpn, 1, port->replay_window))))
+			    sa, xpn, port->replay_window))))
 	{
 	  next0 = SONIC_EXT_MACSEC_DECRYPT_NEXT_DROP;
 	  b[0]->error = node->errors[SONIC_EXT_MACSEC_DECRYPT_ERROR_LATE];
@@ -314,7 +313,6 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
 
       dec_slots[n_dec] = slot;
       dec_sas[n_dec] = sa;
-      dec_scs[n_dec] = sc;
       dec_sa_index[n_dec] = sa_index;
       dec_user_len[n_dec] = secure_len;
       sectag_lens[n_dec] = sectag_len;
@@ -355,7 +353,6 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       u32 next0 = 0;
       vlib_buffer_t *b0 = bufs[slot];
       sonic_ext_macsec_sa_t *sa = dec_sas[i];
-      sonic_ext_macsec_sc_t *sc = dec_scs[i];
       sonic_ext_macsec_port_t *port;
       u8 sectag_len = sectag_lens[i];
       u64 xpn = xpns[i];
@@ -392,7 +389,7 @@ VLIB_NODE_FN (sonic_ext_macsec_decrypt_node)
       port = sonic_ext_macsec_port_get (vnet_buffer (b0)->sw_if_index[VLIB_RX],
 				       SONIC_EXT_MACSEC_INGRESS);
       sonic_ext_macsec_replay_advance (
-	sc, xpn, port ? port->replay_window : 0);
+	sa, xpn, port ? port->replay_window : 0);
       if (xpn + 1 > sa->next_xpn)
 	clib_atomic_store_rel_n (&sa->next_xpn, xpn + 1);
       sonic_ext_macsec_sa_publish_xpn (sa);

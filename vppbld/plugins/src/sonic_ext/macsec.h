@@ -102,8 +102,6 @@ typedef struct
   u32 port_index;
   u8 direction, cipher, encoding_an;
   u32 sa_index[SONIC_EXT_MACSEC_AN_MAX]; /* ~0 absent */
-  u64 highest_xpn_seen;
-  u64 replay_bitmap_lo, replay_bitmap_hi; /* bit 0 = highest_seen */
 } sonic_ext_macsec_sc_t;
 
 typedef struct
@@ -113,6 +111,10 @@ typedef struct
   u32 ssci;
   vnet_crypto_ctx_t *crypto_ctx;
   u64 next_xpn, lowest_acceptable_xpn;
+  /* IEEE 802.1AE PN space is per SA (AN). Sharing these on the SC
+   * makes a new AN's PN=1 look late after the previous AN. */
+  u64 highest_xpn_seen;
+  u64 replay_bitmap_lo, replay_bitmap_hi; /* bit 0 = highest_seen */
   u32 xpn_gauge_index;
   u32 stat_symlink_index[SONIC_EXT_MACSEC_N_SA_STATS];
 } sonic_ext_macsec_sa_t;
@@ -348,18 +350,15 @@ sonic_ext_macsec_build_iv (u8 *iv, const sonic_ext_macsec_sa_t *sa, u64 sci,
   }
 }
 
-/* Sliding 128-bit window over recovered XPN. bit 0 = highest_seen. */
+/* Sliding 128-bit window over this SA's recovered XPN. bit 0 = highest_seen. */
 static_always_inline int
-sonic_ext_macsec_replay_is_late (const sonic_ext_macsec_sc_t *sc, u64 xpn,
-				 u8 replay_protect, u32 replay_window)
+sonic_ext_macsec_replay_is_late (const sonic_ext_macsec_sa_t *sa, u64 xpn,
+				 u32 replay_window)
 {
   u64 highest, delta;
   u32 window;
 
-  if (!replay_protect)
-    return 0;
-
-  highest = sc->highest_xpn_seen;
+  highest = sa->highest_xpn_seen;
   window = replay_window > 128 ? 128 : replay_window;
 
   if (xpn > highest)
@@ -369,15 +368,15 @@ sonic_ext_macsec_replay_is_late (const sonic_ext_macsec_sc_t *sc, u64 xpn,
 
   delta = highest - xpn;
   if (delta < 64)
-    return (sc->replay_bitmap_lo & (1ULL << delta)) != 0;
-  return (sc->replay_bitmap_hi & (1ULL << (delta - 64))) != 0;
+    return (sa->replay_bitmap_lo & (1ULL << delta)) != 0;
+  return (sa->replay_bitmap_hi & (1ULL << (delta - 64))) != 0;
 }
 
 static_always_inline void
-sonic_ext_macsec_replay_advance (sonic_ext_macsec_sc_t *sc, u64 xpn,
+sonic_ext_macsec_replay_advance (sonic_ext_macsec_sa_t *sa, u64 xpn,
 				 u32 replay_window)
 {
-  u64 highest = sc->highest_xpn_seen;
+  u64 highest = sa->highest_xpn_seen;
   u32 window = replay_window > 128 ? 128 : replay_window;
 
   if (xpn > highest)
@@ -386,22 +385,22 @@ sonic_ext_macsec_replay_advance (sonic_ext_macsec_sc_t *sc, u64 xpn,
 
       if (window == 0 || shift >= 128)
 	{
-	  sc->replay_bitmap_lo = 1ULL;
-	  sc->replay_bitmap_hi = 0;
+	  sa->replay_bitmap_lo = 1ULL;
+	  sa->replay_bitmap_hi = 0;
 	}
       else if (shift < 64)
 	{
-	  sc->replay_bitmap_hi =
-	    (sc->replay_bitmap_hi << shift) |
-	    (sc->replay_bitmap_lo >> (64 - (u8) shift));
-	  sc->replay_bitmap_lo = (sc->replay_bitmap_lo << shift) | 1ULL;
+	  sa->replay_bitmap_hi =
+	    (sa->replay_bitmap_hi << shift) |
+	    (sa->replay_bitmap_lo >> (64 - (u8) shift));
+	  sa->replay_bitmap_lo = (sa->replay_bitmap_lo << shift) | 1ULL;
 	}
       else
 	{
-	  sc->replay_bitmap_hi = sc->replay_bitmap_lo << (shift - 64);
-	  sc->replay_bitmap_lo = 1ULL;
+	  sa->replay_bitmap_hi = sa->replay_bitmap_lo << (shift - 64);
+	  sa->replay_bitmap_lo = 1ULL;
 	}
-      sc->highest_xpn_seen = xpn;
+      sa->highest_xpn_seen = xpn;
       return;
     }
 
@@ -410,9 +409,9 @@ sonic_ext_macsec_replay_advance (sonic_ext_macsec_sc_t *sc, u64 xpn,
       u64 delta = highest - xpn;
 
       if (delta < 64)
-	sc->replay_bitmap_lo |= 1ULL << delta;
+	sa->replay_bitmap_lo |= 1ULL << delta;
       else if (delta < 128)
-	sc->replay_bitmap_hi |= 1ULL << (delta - 64);
+	sa->replay_bitmap_hi |= 1ULL << (delta - 64);
     }
 }
 

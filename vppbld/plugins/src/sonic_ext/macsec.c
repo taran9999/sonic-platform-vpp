@@ -717,6 +717,7 @@ sonic_ext_macsec_sa_add_del (u32 sw_if_index, u8 direction, u64 sci, u8 an,
   sa->crypto_ctx = ctx;
   sa->next_xpn = init_xpn ? init_xpn : 1;
   sa->lowest_acceptable_xpn = sa->next_xpn;
+  sa->highest_xpn_seen = sa->next_xpn - 1;
   sa->xpn_gauge_index = ~0;
   {
     u32 i;
@@ -749,6 +750,9 @@ sonic_ext_macsec_sa_set_xpn (u32 sw_if_index, u8 direction, u64 sci, u8 an,
 
   clib_atomic_store_rel_n (&sa->next_xpn, xpn);
   clib_atomic_store_rel_n (&sa->lowest_acceptable_xpn, xpn);
+  sa->highest_xpn_seen = xpn ? xpn - 1 : 0;
+  sa->replay_bitmap_lo = 0;
+  sa->replay_bitmap_hi = 0;
   sonic_ext_macsec_sa_publish_xpn (sa);
   return 0;
 }

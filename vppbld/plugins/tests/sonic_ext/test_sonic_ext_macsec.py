@@ -676,6 +676,114 @@ class TestSonicExtMacsec(SonicExtMacsecBase):
             before + 1,
         )
 
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build replay frames")
+    def test_replay_new_an_pn_restart(self):
+        """new AN has its own PN space; AN=1 PN=1 is not late after AN=0"""
+        pkt = self.data_pkt()
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            replay_protect=1,
+            replay_window=0,
+        )
+        first = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=0, pn=5, send_sci=True
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(first)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+        self.add_sa(
+            self.pg0.sw_if_index, DIR_INGRESS, an=1, set_encoding=False
+        )
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+        )
+        nxt = macsec_protect(
+            raw(pkt), TEST_SAK, TEST_SCI, an=1, pn=1, send_sci=True
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(nxt)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+            ),
+            before,
+        )
+        self.send_and_assert_no_replies(self.pg0, [self.wire_pkt(nxt)])
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+            ),
+            before + 1,
+        )
+        sa_out = self.vapi.cli("show macsec sa")
+        self.assertRegex(sa_out, r"in-ok 1")
+        self.assertRegex(sa_out, r"in-late 1")
+
+    @unittest.skipUnless(HAVE_GCM, "no AES-GCM library to build XPN replay frames")
+    def test_replay_new_an_xpn_pn_restart(self):
+        """XPN recover/replay are per-SA so AN=1 PN=1 is not late after AN=0"""
+        pkt = self.data_pkt()
+        self.add_secy(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            cipher_suite=CS_GCM_AES_XPN_256,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+            replay_protect=1,
+            replay_window=0,
+        )
+        first = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=0,
+            pn=1000,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(first)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+
+        self.add_sa(
+            self.pg0.sw_if_index,
+            DIR_INGRESS,
+            an=1,
+            sak=TEST_SAK_256,
+            sak_len=32,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=1,
+            set_encoding=False,
+        )
+        before = self.statistics.get_err_counter(
+            "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+        )
+        nxt = macsec_protect(
+            raw(pkt),
+            TEST_SAK_256,
+            TEST_SCI,
+            an=1,
+            pn=1,
+            send_sci=True,
+            salt=TEST_SALT,
+            ssci=TEST_SSCI,
+            xpn_en=True,
+        )
+        rx = self.send_and_expect(self.pg0, [self.wire_pkt(nxt)], self.pg1)[0]
+        self.assertEqual(raw(rx)[: len(raw(pkt))], raw(pkt))
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/sonic-ext-macsec-decrypt/dropped: replay late"
+            ),
+            before,
+        )
+
     @unittest.skipUnless(HAVE_GCM, "no AES-GCM library for the rekey vector")
     def test_rekey_encoding_an(self):
         """AN flip under traffic uses the new SA; deleting the old SA is lossless"""
